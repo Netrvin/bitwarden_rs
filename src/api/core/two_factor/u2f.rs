@@ -28,13 +28,7 @@ static APP_ID: Lazy<String> = Lazy::new(|| format!("{}/app-id.json", &CONFIG.dom
 static U2F: Lazy<U2f> = Lazy::new(|| U2f::new(APP_ID.clone()));
 
 pub fn routes() -> Vec<Route> {
-    routes![
-        generate_u2f,
-        generate_u2f_challenge,
-        activate_u2f,
-        activate_u2f_put,
-        delete_u2f,
-    ]
+    routes![generate_u2f, generate_u2f_challenge, activate_u2f, activate_u2f_put, delete_u2f,]
 }
 
 #[post("/two-factor/get-u2f", data = "<data>")]
@@ -100,13 +94,14 @@ struct RegistrationDef {
 }
 
 #[derive(Serialize, Deserialize)]
-struct U2FRegistration {
-    id: i32,
-    name: String,
+pub struct U2FRegistration {
+    pub id: i32,
+    pub name: String,
     #[serde(with = "RegistrationDef")]
-    reg: Registration,
-    counter: u32,
+    pub reg: Registration,
+    pub counter: u32,
     compromised: bool,
+    pub migrated: Option<bool>,
 }
 
 impl U2FRegistration {
@@ -131,12 +126,12 @@ struct RegisterResponseCopy {
     pub error_code: Option<NumberOrString>,
 }
 
-impl Into<RegisterResponse> for RegisterResponseCopy {
-    fn into(self) -> RegisterResponse {
+impl From<RegisterResponseCopy> for RegisterResponse {
+    fn from(r: RegisterResponseCopy) -> RegisterResponse {
         RegisterResponse {
-            registration_data: self.registration_data,
-            version: self.version,
-            client_data: self.client_data,
+            registration_data: r.registration_data,
+            version: r.version,
+            client_data: r.client_data,
         }
     }
 }
@@ -161,10 +156,7 @@ fn activate_u2f(data: JsonUpcase<EnableU2FData>, headers: Headers, conn: DbConn)
 
     let response: RegisterResponseCopy = serde_json::from_str(&data.DeviceResponse)?;
 
-    let error_code = response
-        .error_code
-        .clone()
-        .map_or("0".into(), NumberOrString::into_string);
+    let error_code = response.error_code.clone().map_or("0".into(), NumberOrString::into_string);
 
     if error_code != "0" {
         err!("Error registering U2F token")
@@ -177,6 +169,7 @@ fn activate_u2f(data: JsonUpcase<EnableU2FData>, headers: Headers, conn: DbConn)
         reg: registration,
         compromised: false,
         counter: 0,
+        migrated: None,
     };
 
     let mut regs = get_u2f_registrations(&user.uuid, &conn)?.1;
@@ -255,7 +248,7 @@ fn _create_u2f_challenge(user_uuid: &str, type_: TwoFactorType, conn: &DbConn) -
 }
 
 fn save_u2f_registrations(user_uuid: &str, regs: &[U2FRegistration], conn: &DbConn) -> EmptyResult {
-    TwoFactor::new(user_uuid.into(), TwoFactorType::U2f, serde_json::to_string(regs)?).save(&conn)
+    TwoFactor::new(user_uuid.into(), TwoFactorType::U2f, serde_json::to_string(regs)?).save(conn)
 }
 
 fn get_u2f_registrations(user_uuid: &str, conn: &DbConn) -> Result<(bool, Vec<U2FRegistration>), Error> {
@@ -282,10 +275,11 @@ fn get_u2f_registrations(user_uuid: &str, conn: &DbConn) -> Result<(bool, Vec<U2
                 reg: old_regs.remove(0),
                 compromised: false,
                 counter: 0,
+                migrated: None,
             }];
 
             // Save new format
-            save_u2f_registrations(user_uuid, &new_regs, &conn)?;
+            save_u2f_registrations(user_uuid, &new_regs, conn)?;
 
             new_regs
         }
@@ -300,20 +294,13 @@ fn _old_parse_registrations(registations: &str) -> Vec<Registration> {
 
     let regs: Vec<Value> = serde_json::from_str(registations).expect("Can't parse Registration data");
 
-    regs.into_iter()
-        .map(|r| serde_json::from_value(r).unwrap())
-        .map(|Helper(r)| r)
-        .collect()
+    regs.into_iter().map(|r| serde_json::from_value(r).unwrap()).map(|Helper(r)| r).collect()
 }
 
 pub fn generate_u2f_login(user_uuid: &str, conn: &DbConn) -> ApiResult<U2fSignRequest> {
     let challenge = _create_u2f_challenge(user_uuid, TwoFactorType::U2fLoginChallenge, conn);
 
-    let registrations: Vec<_> = get_u2f_registrations(user_uuid, conn)?
-        .1
-        .into_iter()
-        .map(|r| r.reg)
-        .collect();
+    let registrations: Vec<_> = get_u2f_registrations(user_uuid, conn)?.1.into_iter().map(|r| r.reg).collect();
 
     if registrations.is_empty() {
         err!("No U2F devices registered")
@@ -324,12 +311,12 @@ pub fn generate_u2f_login(user_uuid: &str, conn: &DbConn) -> ApiResult<U2fSignRe
 
 pub fn validate_u2f_login(user_uuid: &str, response: &str, conn: &DbConn) -> EmptyResult {
     let challenge_type = TwoFactorType::U2fLoginChallenge as i32;
-    let tf_challenge = TwoFactor::find_by_user_and_type(user_uuid, challenge_type, &conn);
+    let tf_challenge = TwoFactor::find_by_user_and_type(user_uuid, challenge_type, conn);
 
     let challenge = match tf_challenge {
         Some(tf_challenge) => {
             let challenge: Challenge = serde_json::from_str(&tf_challenge.data)?;
-            tf_challenge.delete(&conn)?;
+            tf_challenge.delete(conn)?;
             challenge
         }
         None => err!("Can't recover login challenge"),
@@ -345,13 +332,13 @@ pub fn validate_u2f_login(user_uuid: &str, response: &str, conn: &DbConn) -> Emp
         match response {
             Ok(new_counter) => {
                 reg.counter = new_counter;
-                save_u2f_registrations(user_uuid, &registrations, &conn)?;
+                save_u2f_registrations(user_uuid, &registrations, conn)?;
 
                 return Ok(());
             }
             Err(u2f::u2ferror::U2fError::CounterTooLow) => {
                 reg.compromised = true;
-                save_u2f_registrations(user_uuid, &registrations, &conn)?;
+                save_u2f_registrations(user_uuid, &registrations, conn)?;
 
                 err!("This device might be compromised!");
             }

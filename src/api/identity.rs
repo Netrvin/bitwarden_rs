@@ -72,7 +72,8 @@ fn _refresh_login(data: ConnectData, conn: DbConn) -> JsonResult {
         "Kdf": user.client_kdf_type,
         "KdfIterations": user.client_kdf_iter,
         "ResetMasterPassword": false, // TODO: according to official server seems something like: user.password_hash.is_empty(), but would need testing
-        "scope": "api offline_access"
+        "scope": "api offline_access",
+        "unofficialServer": true,
     })))
 }
 
@@ -87,34 +88,28 @@ fn _password_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonResult
     let username = data.username.as_ref().unwrap();
     let user = match User::find_by_mail(username, &conn) {
         Some(user) => user,
-        None => err!(
-            "Username or password is incorrect. Try again",
-            format!("IP: {}. Username: {}.", ip.ip, username)
-        ),
+        None => err!("Username or password is incorrect. Try again", format!("IP: {}. Username: {}.", ip.ip, username)),
     };
 
     // Check password
     let password = data.password.as_ref().unwrap();
     if !user.check_valid_password(password) {
-        err!(
-            "Username or password is incorrect. Try again",
-            format!("IP: {}. Username: {}.", ip.ip, username)
-        )
+        err!("Username or password is incorrect. Try again", format!("IP: {}. Username: {}.", ip.ip, username))
     }
 
     // Check if the user is disabled
     if !user.enabled {
-        err!(
-            "This user has been disabled",
-            format!("IP: {}. Username: {}.", ip.ip, username)
-        )
+        err!("This user has been disabled", format!("IP: {}. Username: {}.", ip.ip, username))
     }
 
     let now = Local::now();
 
     if user.verified_at.is_none() && CONFIG.mail_enabled() && CONFIG.signups_verify() {
         let now = now.naive_utc();
-        if user.last_verifying_at.is_none() || now.signed_duration_since(user.last_verifying_at.unwrap()).num_seconds() > CONFIG.signups_verify_resend_time() as i64 {
+        if user.last_verifying_at.is_none()
+            || now.signed_duration_since(user.last_verifying_at.unwrap()).num_seconds()
+                > CONFIG.signups_verify_resend_time() as i64
+        {
             let resend_limit = CONFIG.signups_verify_resend_limit() as i32;
             if resend_limit == 0 || user.login_verify_count < resend_limit {
                 // We want to send another email verification if we require signups to verify
@@ -134,15 +129,12 @@ fn _password_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonResult
         }
 
         // We still want the login to fail until they actually verified the email address
-        err!(
-            "Please verify your email before trying again.",
-            format!("IP: {}. Username: {}.", ip.ip, username)
-        )
+        err!("Please verify your email before trying again.", format!("IP: {}. Username: {}.", ip.ip, username))
     }
 
     let (mut device, new_device) = get_device(&data, &conn, &user);
 
-    let twofactor_token = twofactor_auth(&user.uuid, &data, &mut device, &ip, &conn)?;
+    let twofactor_token = twofactor_auth(&user.uuid, &data, &mut device, ip, &conn)?;
 
     if CONFIG.mail_enabled() && new_device {
         if let Err(e) = mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &now, &device.name) {
@@ -168,11 +160,12 @@ fn _password_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonResult
         "Key": user.akey,
         "PrivateKey": user.private_key,
         //"TwoFactorToken": "11122233333444555666777888999"
-        
+
         "Kdf": user.client_kdf_type,
         "KdfIterations": user.client_kdf_iter,
         "ResetMasterPassword": false,// TODO: Same as above
-        "scope": "api offline_access"
+        "scope": "api offline_access",
+        "unofficialServer": true,
     });
 
     if let Some(token) = twofactor_token {
@@ -192,7 +185,7 @@ fn get_device(data: &ConnectData, conn: &DbConn, user: &User) -> (Device, bool) 
 
     let mut new_device = false;
     // Find device or create new
-    let device = match Device::find_by_uuid(&device_id, &conn) {
+    let device = match Device::find_by_uuid(&device_id, conn) {
         Some(device) => {
             // Check if owned device, and recreate if not
             if device.user_uuid != user.uuid {
@@ -234,9 +227,7 @@ fn twofactor_auth(
         None => err_json!(_json_err_twofactor(&twofactor_ids, user_uuid, conn)?, "2FA token not provided"),
     };
 
-    let selected_twofactor = twofactors
-        .into_iter()
-        .find(|tf| tf.atype == selected_id && tf.enabled);
+    let selected_twofactor = twofactors.into_iter().find(|tf| tf.atype == selected_id && tf.enabled);
 
     use crate::api::core::two_factor as _tf;
     use crate::crypto::ct_eq;
@@ -245,18 +236,27 @@ fn twofactor_auth(
     let mut remember = data.two_factor_remember.unwrap_or(0);
 
     match TwoFactorType::from_i32(selected_id) {
-        Some(TwoFactorType::Authenticator) => _tf::authenticator::validate_totp_code_str(user_uuid, twofactor_code, &selected_data?, ip, conn)?,
+        Some(TwoFactorType::Authenticator) => {
+            _tf::authenticator::validate_totp_code_str(user_uuid, twofactor_code, &selected_data?, ip, conn)?
+        }
         Some(TwoFactorType::U2f) => _tf::u2f::validate_u2f_login(user_uuid, twofactor_code, conn)?,
+        Some(TwoFactorType::Webauthn) => _tf::webauthn::validate_webauthn_login(user_uuid, twofactor_code, conn)?,
         Some(TwoFactorType::YubiKey) => _tf::yubikey::validate_yubikey_login(twofactor_code, &selected_data?)?,
-        Some(TwoFactorType::Duo) => _tf::duo::validate_duo_login(data.username.as_ref().unwrap(), twofactor_code, conn)?,
-        Some(TwoFactorType::Email) => _tf::email::validate_email_code_str(user_uuid, twofactor_code, &selected_data?, conn)?,
+        Some(TwoFactorType::Duo) => {
+            _tf::duo::validate_duo_login(data.username.as_ref().unwrap(), twofactor_code, conn)?
+        }
+        Some(TwoFactorType::Email) => {
+            _tf::email::validate_email_code_str(user_uuid, twofactor_code, &selected_data?, conn)?
+        }
 
         Some(TwoFactorType::Remember) => {
             match device.twofactor_remember {
                 Some(ref code) if !CONFIG.disable_2fa_remember() && ct_eq(code, twofactor_code) => {
                     remember = 1; // Make sure we also return the token here, otherwise it will only remember the first time
                 }
-                _ => err_json!(_json_err_twofactor(&twofactor_ids, user_uuid, conn)?, "2FA Remember token not provided"),
+                _ => {
+                    err_json!(_json_err_twofactor(&twofactor_ids, user_uuid, conn)?, "2FA Remember token not provided")
+                }
             }
         }
         _ => err!("Invalid two factor provider"),
@@ -310,8 +310,13 @@ fn _json_err_twofactor(providers: &[i32], user_uuid: &str, conn: &DbConn) -> Api
                 });
             }
 
+            Some(TwoFactorType::Webauthn) if CONFIG.domain_set() => {
+                let request = two_factor::webauthn::generate_webauthn_login(user_uuid, conn)?;
+                result["TwoFactorProviders2"][provider.to_string()] = request.0;
+            }
+
             Some(TwoFactorType::Duo) => {
-                let email = match User::find_by_uuid(user_uuid, &conn) {
+                let email = match User::find_by_uuid(user_uuid, conn) {
                     Some(u) => u.email,
                     None => err!("User does not exist"),
                 };
@@ -325,7 +330,7 @@ fn _json_err_twofactor(providers: &[i32], user_uuid: &str, conn: &DbConn) -> Api
             }
 
             Some(tf_type @ TwoFactorType::YubiKey) => {
-                let twofactor = match TwoFactor::find_by_user_and_type(user_uuid, tf_type as i32, &conn) {
+                let twofactor = match TwoFactor::find_by_user_and_type(user_uuid, tf_type as i32, conn) {
                     Some(tf) => tf,
                     None => err!("No YubiKey devices registered"),
                 };
@@ -340,14 +345,14 @@ fn _json_err_twofactor(providers: &[i32], user_uuid: &str, conn: &DbConn) -> Api
             Some(tf_type @ TwoFactorType::Email) => {
                 use crate::api::core::two_factor as _tf;
 
-                let twofactor = match TwoFactor::find_by_user_and_type(user_uuid, tf_type as i32, &conn) {
+                let twofactor = match TwoFactor::find_by_user_and_type(user_uuid, tf_type as i32, conn) {
                     Some(tf) => tf,
                     None => err!("No twofactor email registered"),
                 };
 
                 // Send email immediately if email is the only 2FA option
                 if providers.len() == 1 {
-                    _tf::email::send_token(&user_uuid, &conn)?
+                    _tf::email::send_token(user_uuid, conn)?
                 }
 
                 let email_data = EmailTokenData::from_json(&twofactor.data)?;

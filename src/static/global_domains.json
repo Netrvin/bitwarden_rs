@@ -198,7 +198,9 @@
       "amazon.in",
       "amazon.it",
       "amazon.nl",
+      "amazon.pl",
       "amazon.sa",
+      "amazon.se",
       "amazon.sg"
     ],
     "Excluded": false
@@ -772,7 +774,8 @@
       "stackoverflow.com",
       "serverfault.com",
       "mathoverflow.net",
-      "askubuntu.com"
+      "askubuntu.com",
+      "stackapps.com"
     ],
     "Excluded": false
   },
@@ -892,6 +895,14 @@
     "Domains": [
       "sonyentertainmentnetwork.com",
       "sony.com"
+    ],
+    "Excluded": false
+  },
+  {
+    "Type": 85,
+    "Domains": [
+      "protonmail.com",
+      "protonvpn.com"
     ],
     "Excluded": false
   }

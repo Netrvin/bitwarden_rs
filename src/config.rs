@@ -57,6 +57,8 @@ macro_rules! make_config {
 
             _env: ConfigBuilder,
             _usr: ConfigBuilder,
+
+            _overrides: Vec<String>,
         }
 
         #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -79,20 +81,16 @@ macro_rules! make_config {
                         dotenv::Error::Io(ioerr) => match ioerr.kind() {
                             std::io::ErrorKind::NotFound => {
                                 println!("[INFO] No .env file found.\n");
-                                ()
                             },
                             std::io::ErrorKind::PermissionDenied => {
                                 println!("[WARNING] Permission Denied while trying to read the .env file!\n");
-                                ()
                             },
                             _ => {
                                 println!("[WARNING] Reading the .env file failed:\n{:?}\n", ioerr);
-                                ()
                             }
                         },
                         _ => {
                             println!("[WARNING] Reading the .env file failed:\n{:?}\n", e);
-                            ()
                         }
                     }
                 };
@@ -113,8 +111,7 @@ macro_rules! make_config {
 
             /// Merges the values of both builders into a new builder.
             /// If both have the same element, `other` wins.
-            fn merge(&self, other: &Self, show_overrides: bool) -> Self {
-                let mut overrides = Vec::new();
+            fn merge(&self, other: &Self, show_overrides: bool, overrides: &mut Vec<String>) -> Self {
                 let mut builder = self.clone();
                 $($(
                     if let v @Some(_) = &other.$name {
@@ -176,9 +173,9 @@ macro_rules! make_config {
             )+)+
 
             pub fn prepare_json(&self) -> serde_json::Value {
-                let (def, cfg) = {
+                let (def, cfg, overriden) = {
                     let inner = &self.inner.read().unwrap();
-                    (inner._env.build(), inner.config.clone())
+                    (inner._env.build(), inner.config.clone(), inner._overrides.clone())
                 };
 
                 fn _get_form_type(rust_type: &str) -> &'static str {
@@ -210,6 +207,7 @@ macro_rules! make_config {
                         "default": def.$name,
                         "type":  _get_form_type(stringify!($ty)),
                         "doc": _get_doc(concat!($($doc),+)),
+                        "overridden": overriden.contains(&stringify!($name).to_uppercase()),
                     }, )+
                     ]}, )+ ])
             }
@@ -223,6 +221,15 @@ macro_rules! make_config {
                 json!({ $($(
                     stringify!($name): make_config!{ @supportstr $name, cfg.$name, $ty, $none_action },
                 )+)+ })
+            }
+
+            pub fn get_overrides(&self) -> Vec<String> {
+                let overrides = {
+                    let inner = &self.inner.read().unwrap();
+                    inner._overrides.clone()
+                };
+
+                overrides
             }
         }
     };
@@ -299,6 +306,8 @@ make_config! {
         icon_cache_folder:      String, false,  auto,   |c| format!("{}/{}", c.data_folder, "icon_cache");
         /// Attachments folder
         attachments_folder:     String, false,  auto,   |c| format!("{}/{}", c.data_folder, "attachments");
+        /// Sends folder
+        sends_folder:           String, false,  auto,   |c| format!("{}/{}", c.data_folder, "sends");
         /// Templates folder
         templates_folder:       String, false,  auto,   |c| format!("{}/{}", c.data_folder, "templates");
         /// Session JWT key
@@ -313,6 +322,17 @@ make_config! {
         websocket_address:      String, false,  def,    "0.0.0.0".to_string();
         /// Websocket port
         websocket_port:         u16,    false,  def,    3012;
+    },
+    jobs {
+        /// Job scheduler poll interval |> How often the job scheduler thread checks for jobs to run.
+        /// Set to 0 to globally disable scheduled jobs.
+        job_poll_interval_ms:   u64,    false,  def,    30_000;
+        /// Send purge schedule |> Cron schedule of the job that checks for Sends past their deletion date.
+        /// Defaults to hourly. Set blank to disable this job.
+        send_purge_schedule:    String, false,  def,    "0 5 * * * *".to_string();
+        /// Trash purge schedule |> Cron schedule of the job that checks for trashed items to delete permanently.
+        /// Defaults to daily. Set blank to disable this job.
+        trash_purge_schedule:   String, false,  def,    "0 5 0 * * *".to_string();
     },
 
     /// General settings
@@ -329,6 +349,10 @@ make_config! {
         /// Enable web vault
         web_vault_enabled:      bool,   false,  def,    true;
 
+        /// Allow Sends |> Controls whether users are allowed to create Bitwarden Sends.
+        /// This setting applies globally to all users. To control this on a per-org basis instead, use the "Disable Send" org policy.
+        sends_allowed:          bool,   true,   def,    true;
+
         /// HIBP Api Key |> HaveIBeenPwned API Key, request it here: https://haveibeenpwned.com/API/Key
         hibp_api_key:           Pass,   true,   option;
 
@@ -337,11 +361,16 @@ make_config! {
         /// Per-organization attachment limit (KB) |> Limit in kilobytes for an organization attachments, once the limit is exceeded it won't be possible to upload more
         org_attachment_limit:   i64,    true,   option;
 
+        /// Trash auto-delete days |> Number of days to wait before auto-deleting a trashed item.
+        /// If unset, trashed items are not auto-deleted. This setting applies globally, so make
+        /// sure to inform all users of any changes to this setting.
+        trash_auto_delete_days: i64,    true,   option;
+
         /// Disable icon downloads |> Set to true to disable icon downloading, this would still serve icons from
         /// $ICON_CACHE_FOLDER, but it won't produce any external network request. Needs to set $ICON_CACHE_TTL to 0,
         /// otherwise it will delete them and they won't be downloaded again.
         disable_icon_download:  bool,   true,   def,    false;
-        /// Allow new signups |> Controls whether new users can register. Users can be invited by the bitwarden_rs admin even if this is disabled
+        /// Allow new signups |> Controls whether new users can register. Users can be invited by the vaultwarden admin even if this is disabled
         signups_allowed:        bool,   true,   def,    true;
         /// Require email verification on signups. This will prevent logins from succeeding until the address has been verified
         signups_verify:         bool,   true,   def,    false;
@@ -367,7 +396,7 @@ make_config! {
         admin_token:            Pass,   true,   option;
 
         /// Invitation organization name |> Name shown in the invitation emails that don't come from a specific organization
-        invitation_org_name:    String, true,   def,    "Bitwarden_RS".to_string();
+        invitation_org_name:    String, true,   def,    "Vaultwarden".to_string();
     },
 
     /// Advanced settings
@@ -416,7 +445,7 @@ make_config! {
         /// Log level
         log_level:              String, false,  def,    "Info".to_string();
 
-        /// Enable DB WAL |> Turning this off might lead to worse performance, but might help if using bitwarden_rs on some exotic filesystems,
+        /// Enable DB WAL |> Turning this off might lead to worse performance, but might help if using vaultwarden on some exotic filesystems,
         /// that do not support WAL. Please make sure you read project wiki on the topic before changing this setting.
         enable_db_wal:          bool,   false,  def,    true;
 
@@ -471,7 +500,7 @@ make_config! {
         /// From Address
         smtp_from:                     String, true,   def,     String::new();
         /// From Name
-        smtp_from_name:                String, true,   def,     "Bitwarden_RS".to_string();
+        smtp_from_name:                String, true,   def,     "Vaultwarden".to_string();
         /// Username
         smtp_username:                 String, true,   option;
         /// Password
@@ -483,7 +512,7 @@ make_config! {
         /// Server name sent during HELO |> By default this value should be is on the machine's hostname, but might need to be changed in case it trips some anti-spam filters
         helo_name:                     String, true,   option;
         /// Enable SMTP debugging (Know the risks!) |> DANGEROUS: Enabling this will output very detailed SMTP messages. This could contain sensitive information like passwords and usernames! Only enable this during troubleshooting!
-        smtp_debug:                    bool,   true,   def,     false;
+        smtp_debug:                    bool,   false,  def,     false;
         /// Accept Invalid Certs (Know the risks!) |> DANGEROUS: Allow invalid certificates. This option introduces significant vulnerabilities to man-in-the-middle attacks!
         smtp_accept_invalid_certs:     bool,   true,   def,     false;
         /// Accept Invalid Hostnames (Know the risks!) |> DANGEROUS: Allow invalid hostnames. This option introduces significant vulnerabilities to man-in-the-middle attacks!
@@ -509,10 +538,7 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
 
     let limit = 256;
     if cfg.database_max_conns < 1 || cfg.database_max_conns > limit {
-        err!(format!(
-            "`DATABASE_MAX_CONNS` contains an invalid value. Ensure it is between 1 and {}.",
-            limit,
-        ));
+        err!(format!("`DATABASE_MAX_CONNS` contains an invalid value. Ensure it is between 1 and {}.", limit,));
     }
 
     let dom = cfg.domain.to_lowercase();
@@ -580,7 +606,7 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
 
     // Check if the icon blacklist regex is valid
     if let Some(ref r) = cfg.icon_blacklist_regex {
-        let validate_regex = Regex::new(&r);
+        let validate_regex = Regex::new(r);
         match validate_regex {
             Ok(_) => (),
             Err(e) => err!(format!("`ICON_BLACKLIST_REGEX` is invalid: {:#?}", e)),
@@ -620,7 +646,8 @@ impl Config {
         let _usr = ConfigBuilder::from_file(&CONFIG_FILE).unwrap_or_default();
 
         // Create merged config, config file overwrites env
-        let builder = _env.merge(&_usr, true);
+        let mut _overrides = Vec::new();
+        let builder = _env.merge(&_usr, true, &mut _overrides);
 
         // Fill any missing with defaults
         let config = builder.build();
@@ -632,6 +659,7 @@ impl Config {
                 config,
                 _env,
                 _usr,
+                _overrides,
             }),
         })
     }
@@ -647,9 +675,10 @@ impl Config {
         let config_str = serde_json::to_string_pretty(&builder)?;
 
         // Prepare the combined config
+        let mut overrides = Vec::new();
         let config = {
             let env = &self.inner.read().unwrap()._env;
-            env.merge(&builder, false).build()
+            env.merge(&builder, false, &mut overrides).build()
         };
         validate_config(&config)?;
 
@@ -658,6 +687,7 @@ impl Config {
             let mut writer = self.inner.write().unwrap();
             writer.config = config;
             writer._usr = builder;
+            writer._overrides = overrides;
         }
 
         //Save to file
@@ -671,7 +701,8 @@ impl Config {
     pub fn update_config_partial(&self, other: ConfigBuilder) -> Result<(), Error> {
         let builder = {
             let usr = &self.inner.read().unwrap()._usr;
-            usr.merge(&other, false)
+            let mut _overrides = Vec::new();
+            usr.merge(&other, false, &mut _overrides)
         };
         self.update_config(builder)
     }
@@ -732,19 +763,17 @@ impl Config {
             let mut writer = self.inner.write().unwrap();
             writer.config = config;
             writer._usr = usr;
+            writer._overrides = Vec::new();
         }
 
         Ok(())
     }
 
     pub fn private_rsa_key(&self) -> String {
-        format!("{}.der", CONFIG.rsa_key_filename())
-    }
-    pub fn private_rsa_key_pem(&self) -> String {
         format!("{}.pem", CONFIG.rsa_key_filename())
     }
     pub fn public_rsa_key(&self) -> String {
-        format!("{}.pub.der", CONFIG.rsa_key_filename())
+        format!("{}.pub.pem", CONFIG.rsa_key_filename())
     }
     pub fn mail_enabled(&self) -> bool {
         let inner = &self.inner.read().unwrap().config;
@@ -817,6 +846,10 @@ where
     }
 
     // First register default templates here
+    reg!("email/email_header");
+    reg!("email/email_footer");
+    reg!("email/email_footer_text");
+
     reg!("email/change_email", ".html");
     reg!("email/delete_account", ".html");
     reg!("email/invite_accepted", ".html");
@@ -853,9 +886,7 @@ fn case_helper<'reg, 'rc>(
     rc: &mut RenderContext<'reg, 'rc>,
     out: &mut dyn Output,
 ) -> HelperResult {
-    let param = h
-        .param(0)
-        .ok_or_else(|| RenderError::new("Param not found for helper \"case\""))?;
+    let param = h.param(0).ok_or_else(|| RenderError::new("Param not found for helper \"case\""))?;
     let value = param.value().clone();
 
     if h.params().iter().skip(1).any(|x| x.value() == &value) {
@@ -872,21 +903,15 @@ fn js_escape_helper<'reg, 'rc>(
     _rc: &mut RenderContext<'reg, 'rc>,
     out: &mut dyn Output,
 ) -> HelperResult {
-    let param = h
-        .param(0)
-        .ok_or_else(|| RenderError::new("Param not found for helper \"js_escape\""))?;
+    let param = h.param(0).ok_or_else(|| RenderError::new("Param not found for helper \"js_escape\""))?;
 
-    let no_quote = h
-        .param(1)
-        .is_some();
+    let no_quote = h.param(1).is_some();
 
-    let value = param
-        .value()
-        .as_str()
-        .ok_or_else(|| RenderError::new("Param for helper \"js_escape\" is not a String"))?;
+    let value =
+        param.value().as_str().ok_or_else(|| RenderError::new("Param for helper \"js_escape\" is not a String"))?;
 
     let mut escaped_value = value.replace('\\', "").replace('\'', "\\x22").replace('\"', "\\x27");
-    if ! no_quote {
+    if !no_quote {
         escaped_value = format!("&quot;{}&quot;", escaped_value);
     }
 

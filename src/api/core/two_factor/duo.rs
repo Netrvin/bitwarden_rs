@@ -12,6 +12,7 @@ use crate::{
         DbConn,
     },
     error::MapResult,
+    util::get_reqwest_client,
     CONFIG,
 };
 
@@ -59,7 +60,11 @@ impl DuoData {
         ik.replace_range(digits.., replaced);
         sk.replace_range(digits.., replaced);
 
-        Self { host, ik, sk }
+        Self {
+            host,
+            ik,
+            sk,
+        }
     }
 }
 
@@ -185,9 +190,7 @@ fn activate_duo_put(data: JsonUpcase<EnableDuoData>, headers: Headers, conn: DbC
 }
 
 fn duo_api_request(method: &str, path: &str, params: &str, data: &DuoData) -> EmptyResult {
-    const AGENT: &str = "bitwarden_rs:Duo/1.0 (Rust)";
-
-    use reqwest::{blocking::Client, header::*, Method};
+    use reqwest::{header, Method};
     use std::str::FromStr;
 
     // https://duo.com/docs/authapi#api-details
@@ -199,11 +202,13 @@ fn duo_api_request(method: &str, path: &str, params: &str, data: &DuoData) -> Em
 
     let m = Method::from_str(method).unwrap_or_default();
 
-    Client::new()
+    let client = get_reqwest_client();
+
+    client
         .request(m, &url)
         .basic_auth(username, Some(password))
-        .header(USER_AGENT, AGENT)
-        .header(DATE, date)
+        .header(header::USER_AGENT, "vaultwarden:Duo/1.0 (Rust)")
+        .header(header::DATE, date)
         .send()?
         .error_for_status()?;
 
@@ -221,7 +226,7 @@ fn get_user_duo_data(uuid: &str, conn: &DbConn) -> DuoStatus {
     let type_ = TwoFactorType::Duo as i32;
 
     // If the user doesn't have an entry, disabled
-    let twofactor = match TwoFactor::find_by_user_and_type(uuid, type_, &conn) {
+    let twofactor = match TwoFactor::find_by_user_and_type(uuid, type_, conn) {
         Some(t) => t,
         None => return DuoStatus::Disabled(DuoData::global().is_some()),
     };
@@ -242,8 +247,8 @@ fn get_user_duo_data(uuid: &str, conn: &DbConn) -> DuoStatus {
 
 // let (ik, sk, ak, host) = get_duo_keys();
 fn get_duo_keys_email(email: &str, conn: &DbConn) -> ApiResult<(String, String, String, String)> {
-    let data = User::find_by_mail(email, &conn)
-        .and_then(|u| get_user_duo_data(&u.uuid, &conn).data())
+    let data = User::find_by_mail(email, conn)
+        .and_then(|u| get_user_duo_data(&u.uuid, conn).data())
         .or_else(DuoData::global)
         .map_res("Can't fetch Duo keys")?;
 
@@ -338,7 +343,7 @@ fn parse_duo_values(key: &str, val: &str, ikey: &str, prefix: &str, time: i64) -
         err!("Invalid ikey")
     }
 
-    let expire = match expire.parse() {
+    let expire: i64 = match expire.parse() {
         Ok(e) => e,
         Err(_) => err!("Invalid expire time"),
     };

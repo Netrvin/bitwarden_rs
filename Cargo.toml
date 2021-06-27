@@ -1,10 +1,10 @@
 [package]
-name = "bitwarden_rs"
+name = "vaultwarden"
 version = "1.0.0"
 authors = ["Daniel García <dani-garcia@users.noreply.github.com>"]
 edition = "2018"
 
-repository = "https://github.com/dani-garcia/bitwarden_rs"
+repository = "https://github.com/dani-garcia/vaultwarden"
 readme = "README.md"
 license = "GPL-3.0-only"
 publish = false
@@ -28,14 +28,20 @@ syslog = "4.0.1"
 
 [dependencies]
 # Web framework for nightly with a focus on ease-of-use, expressibility, and speed.
-rocket = { version = "0.5.0-dev", features = ["tls"], default-features = false }
-rocket_contrib = "0.5.0-dev"
+rocket = { version = "=0.5.0-dev", features = ["tls"], default-features = false }
+rocket_contrib = "=0.5.0-dev"
 
 # HTTP client
-reqwest = { version = "0.11.0", features = ["blocking", "json"] }
+reqwest = { version = "0.11.4", features = ["blocking", "json", "gzip", "brotli", "socks", "cookies"] }
+
+# Used for custom short lived cookie jar
+cookie = "0.15.0"
+cookie_store = "0.15.0"
+bytes = "1.0.1"
+url = "2.2.2"
 
 # multipart/form-data support
-multipart = { version = "0.17.1", features = ["server"], default-features = false }
+multipart = { version = "0.18.0", features = ["server"], default-features = false }
 
 # WebSockets library
 ws = { version = "0.10.0", package = "parity-ws" }
@@ -47,31 +53,34 @@ rmpv = "0.4.7"
 chashmap = "2.2.2"
 
 # A generic serialization/deserialization framework
-serde = { version = "1.0.123", features = ["derive"] }
-serde_json = "1.0.62"
+serde = { version = "1.0.126", features = ["derive"] }
+serde_json = "1.0.64"
 
 # Logging
 log = "0.4.14"
 fern = { version = "0.6.0", features = ["syslog-4"] }
 
 # A safe, extensible ORM and Query builder
-diesel = { version = "1.4.5", features = [ "chrono", "r2d2"] }
+diesel = { version = "1.4.7", features = [ "chrono", "r2d2"] }
 diesel_migrations = "1.4.0"
 
 # Bundled SQLite
-libsqlite3-sys = { version = "0.18.0", features = ["bundled"], optional = true }
+libsqlite3-sys = { version = "0.22.2", features = ["bundled"], optional = true }
 
 # Crypto-related libraries
-rand = "0.8.3"
+rand = "0.8.4"
 ring = "0.16.20"
 
 # UUID generation
 uuid = { version = "0.8.2", features = ["v4"] }
 
 # Date and time libraries
-chrono = "0.4.19"
+chrono = { version = "0.4.19", features = ["serde"] }
 chrono-tz = "0.5.3"
-time = "0.2.25"
+time = "0.2.27"
+
+# Job scheduler
+job_scheduler = "1.2.1"
 
 # TOTP library
 oath = "0.10.2"
@@ -84,49 +93,50 @@ jsonwebtoken = "7.2.0"
 
 # U2F library
 u2f = "0.2.0"
+webauthn-rs = "0.3.0-alpha.7"
 
 # Yubico Library
-yubico = { version = "0.9.2", features = ["online-tokio"], default-features = false }
+yubico = { version = "0.10.0", features = ["online-tokio"], default-features = false }
 
 # A `dotenv` implementation for Rust
 dotenv = { version = "0.15.0", default-features = false }
 
 # Lazy initialization
-once_cell = "1.5.2"
+once_cell = "1.8.0"
 
 # Numerical libraries
 num-traits = "0.2.14"
 num-derive = "0.3.3"
 
 # Email libraries
-lettre = { version = "0.10.0-alpha.5", features = ["smtp-transport", "builder", "serde", "native-tls", "hostname", "tracing"], default-features = false }
-newline-converter = "0.1.0"
+tracing = { version = "0.1.26", features = ["log"] } # Needed to have lettre trace logging used when SMTP_DEBUG is enabled.
+lettre = { version = "0.10.0-rc.3", features = ["smtp-transport", "builder", "serde", "native-tls", "hostname", "tracing"], default-features = false }
 
 # Template library
-handlebars = { version = "3.5.2", features = ["dir_source"] }
+handlebars = { version = "4.0.1", features = ["dir_source"] }
 
 # For favicon extraction from main website
 html5ever = "0.25.1"
 markup5ever_rcdom = "0.1.0"
-regex = { version = "1.4.3", features = ["std", "perf"], default-features = false }
+regex = { version = "1.5.4", features = ["std", "perf"], default-features = false }
 data-url = "0.1.0"
 
 # Used by U2F, JWT and Postgres
-openssl = "0.10.32"
+openssl = "0.10.34"
 
 # URL encoding library
 percent-encoding = "2.1.0"
 # Punycode conversion
-idna = "0.2.1"
+idna = "0.2.3"
 
 # CLI argument parsing
-pico-args = "0.4.0"
+pico-args = "0.4.2"
 
 # Logging panics to logfile instead stderr only
-backtrace = "0.3.56"
+backtrace = "0.3.60"
 
 # Macro ident concatenation
-paste = "1.0.4"
+paste = "1.0.5"
 
 [patch.crates-io]
 # Use newest ring
@@ -134,4 +144,14 @@ rocket = { git = 'https://github.com/SergioBenitez/Rocket', rev = '263e39b5b429d
 rocket_contrib = { git = 'https://github.com/SergioBenitez/Rocket', rev = '263e39b5b429de1913ce7e3036575a7b4d88b6d7' }
 
 # For favicon extraction from main website
-data-url = { git = 'https://github.com/servo/rust-url', package="data-url", rev = '540ede02d0771824c0c80ff9f57fe8eff38b1291' }
+data-url = { git = 'https://github.com/servo/rust-url', package="data-url", rev = 'eb7330b5296c0d43816d1346211b74182bb4ae37' }
+
+# The maintainer of the `job_scheduler` crate doesn't seem to have responded
+# to any issues or PRs for almost a year (as of April 2021). This hopefully
+# temporary fork updates Cargo.toml to use more up-to-date dependencies.
+# In particular, `cron` has since implemented parsing of some common syntax
+# that wasn't previously supported (https://github.com/zslayton/cron/pull/64).
+job_scheduler = { git = 'https://github.com/jjlin/job_scheduler', rev = 'ee023418dbba2bfe1e30a5fd7d937f9e33739806' }
+
+# Add support for U2F appid extension compatibility
+webauthn-rs = { git = 'https://github.com/kanidm/webauthn-rs', rev = '02a99f534127b30c6f4df7f2d42bc24f76dc4211' }

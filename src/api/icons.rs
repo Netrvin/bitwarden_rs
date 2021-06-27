@@ -3,55 +3,71 @@ use std::{
     fs::{create_dir_all, remove_file, symlink_metadata, File},
     io::prelude::*,
     net::{IpAddr, ToSocketAddrs},
-    sync::RwLock,
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime},
 };
 
 use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest::{blocking::Client, blocking::Response, header, Url};
-use rocket::{http::ContentType, http::Cookie, response::Content, Route};
+use reqwest::{blocking::Client, blocking::Response, header};
+use rocket::{http::ContentType, response::Content, Route};
 
-use crate::{error::Error, util::Cached, CONFIG};
+use crate::{
+    error::Error,
+    util::{get_reqwest_client_builder, Cached},
+    CONFIG,
+};
 
 pub fn routes() -> Vec<Route> {
     routes![icon]
 }
 
-const ALLOWED_CHARS: &str = "_-.";
-
 static CLIENT: Lazy<Client> = Lazy::new(|| {
     // Generate the default headers
     let mut default_headers = header::HeaderMap::new();
-    default_headers.insert(header::USER_AGENT, header::HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Safari/605.1.15"));
-    default_headers.insert(header::ACCEPT_LANGUAGE, header::HeaderValue::from_static("en-US,en;q=0.8"));
+    default_headers
+        .insert(header::USER_AGENT, header::HeaderValue::from_static("Links (2.22; Linux X86_64; GNU C; text)"));
+    default_headers
+        .insert(header::ACCEPT, header::HeaderValue::from_static("text/html, text/*;q=0.5, image/*, */*;q=0.1"));
+    default_headers.insert(header::ACCEPT_LANGUAGE, header::HeaderValue::from_static("en,*;q=0.1"));
     default_headers.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache"));
     default_headers.insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
-    default_headers.insert(header::ACCEPT, header::HeaderValue::from_static("text/html,application/xhtml+xml,application/xml; q=0.9,image/webp,image/apng,*/*;q=0.8"));
 
     // Reuse the client between requests
-    Client::builder()
+    get_reqwest_client_builder()
+        .cookie_provider(Arc::new(Jar::default()))
         .timeout(Duration::from_secs(CONFIG.icon_download_timeout()))
         .default_headers(default_headers)
         .build()
-        .unwrap()
+        .expect("Failed to build icon client")
 });
 
 // Build Regex only once since this takes a lot of time.
 static ICON_REL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)icon$|apple.*icon").unwrap());
+static ICON_REL_BLACKLIST: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)mask-icon").unwrap());
 static ICON_SIZE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?x)(\d+)\D*(\d+)").unwrap());
 
 // Special HashMap which holds the user defined Regex to speedup matching the regex.
 static ICON_BLACKLIST_REGEX: Lazy<RwLock<HashMap<String, Regex>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 
 #[get("/<domain>/icon.png")]
-fn icon(domain: String) -> Option<Cached<Content<Vec<u8>>>> {
+fn icon(domain: String) -> Cached<Content<Vec<u8>>> {
+    const FALLBACK_ICON: &[u8] = include_bytes!("../static/images/fallback-icon.png");
+
     if !is_valid_domain(&domain) {
         warn!("Invalid domain: {}", domain);
-        return None;
+        return Cached::ttl(
+            Content(ContentType::new("image", "png"), FALLBACK_ICON.to_vec()),
+            CONFIG.icon_cache_negttl(),
+        );
     }
 
-    get_icon(&domain).map(|icon| Cached::long(Content(ContentType::new("image", "x-icon"), icon)))
+    match get_icon(&domain) {
+        Some((icon, icon_type)) => {
+            Cached::ttl(Content(ContentType::new("image", icon_type), icon), CONFIG.icon_cache_ttl())
+        }
+        _ => Cached::ttl(Content(ContentType::new("image", "png"), FALLBACK_ICON.to_vec()), CONFIG.icon_cache_negttl()),
+    }
 }
 
 /// Returns if the domain provided is valid or not.
@@ -59,8 +75,10 @@ fn icon(domain: String) -> Option<Cached<Content<Vec<u8>>>> {
 /// This does some manual checks and makes use of Url to do some basic checking.
 /// domains can't be larger then 63 characters (not counting multiple subdomains) according to the RFC's, but we limit the total size to 255.
 fn is_valid_domain(domain: &str) -> bool {
+    const ALLOWED_CHARS: &str = "_-.";
+
     // If parsing the domain fails using Url, it will not work with reqwest.
-    if let Err(parse_error) = Url::parse(format!("https://{}", domain).as_str()) {
+    if let Err(parse_error) = url::Url::parse(format!("https://{}", domain).as_str()) {
         debug!("Domain parse error: '{}' - {:?}", domain, parse_error);
         return false;
     } else if domain.is_empty()
@@ -69,7 +87,10 @@ fn is_valid_domain(domain: &str) -> bool {
         || domain.starts_with('-')
         || domain.ends_with('-')
     {
-        debug!("Domain validation error: '{}' is either empty, contains '..', starts with an '.', starts or ends with a '-'", domain);
+        debug!(
+            "Domain validation error: '{}' is either empty, contains '..', starts with an '.', starts or ends with a '-'",
+            domain
+        );
         return false;
     } else if domain.len() > 255 {
         debug!("Domain validation error: '{}' exceeds 255 characters", domain);
@@ -228,7 +249,7 @@ fn is_domain_blacklisted(domain: &str) -> bool {
             };
 
             // Use the pre-generate Regex stored in a Lazy HashMap.
-            if regex.is_match(&domain) {
+            if regex.is_match(domain) {
                 warn!("Blacklisted domain: {:#?} matched {:#?}", domain, blacklist);
                 is_blacklisted = true;
             }
@@ -238,7 +259,7 @@ fn is_domain_blacklisted(domain: &str) -> bool {
     is_blacklisted
 }
 
-fn get_icon(domain: &str) -> Option<Vec<u8>> {
+fn get_icon(domain: &str) -> Option<(Vec<u8>, String)> {
     let path = format!("{}/{}.png", CONFIG.icon_cache_folder(), domain);
 
     // Check for expiration of negatively cached copy
@@ -247,7 +268,11 @@ fn get_icon(domain: &str) -> Option<Vec<u8>> {
     }
 
     if let Some(icon) = get_cached_icon(&path) {
-        return Some(icon);
+        let icon_type = match get_icon_type(&icon) {
+            Some(x) => x,
+            _ => "x-icon",
+        };
+        return Some((icon, icon_type.to_string()));
     }
 
     if CONFIG.disable_icon_download() {
@@ -255,10 +280,10 @@ fn get_icon(domain: &str) -> Option<Vec<u8>> {
     }
 
     // Get the icon, or None in case of error
-    match download_icon(&domain) {
-        Ok(icon) => {
+    match download_icon(domain) {
+        Ok((icon, icon_type)) => {
             save_icon(&path, &icon);
-            Some(icon)
+            Some((icon, icon_type.unwrap_or("x-icon").to_string()))
         }
         Err(e) => {
             error!("Error downloading icon: {:?}", e);
@@ -319,7 +344,6 @@ fn icon_is_expired(path: &str) -> bool {
     expired.unwrap_or(true)
 }
 
-#[derive(Debug)]
 struct Icon {
     priority: u8,
     href: String,
@@ -327,12 +351,64 @@ struct Icon {
 
 impl Icon {
     const fn new(priority: u8, href: String) -> Self {
-        Self { href, priority }
+        Self {
+            priority,
+            href,
+        }
     }
 }
 
-fn get_favicons_node(node: &std::rc::Rc<markup5ever_rcdom::Node>, icons: &mut Vec<Icon>, url: &Url) {
-    if let markup5ever_rcdom::NodeData::Element { name, attrs, .. } = &node.data {
+/// Iterates over the HTML document to find <base href="http://domain.tld">
+/// When found it will stop the iteration and the found base href will be shared deref via `base_href`.
+///
+/// # Arguments
+/// * `node` - A Parsed HTML document via html5ever::parse_document()
+/// * `base_href` - a mutable url::Url which will be overwritten when a base href tag has been found.
+///
+fn get_base_href(node: &std::rc::Rc<markup5ever_rcdom::Node>, base_href: &mut url::Url) -> bool {
+    if let markup5ever_rcdom::NodeData::Element {
+        name,
+        attrs,
+        ..
+    } = &node.data
+    {
+        if name.local.as_ref() == "base" {
+            let attrs = attrs.borrow();
+            for attr in attrs.iter() {
+                let attr_name = attr.name.local.as_ref();
+                let attr_value = attr.value.as_ref();
+
+                if attr_name == "href" {
+                    debug!("Found base href: {}", attr_value);
+                    *base_href = match base_href.join(attr_value) {
+                        Ok(href) => href,
+                        _ => base_href.clone(),
+                    };
+                    return true;
+                }
+            }
+            return true;
+        }
+    }
+
+    // TODO: Might want to limit the recursion depth?
+    for child in node.children.borrow().iter() {
+        // Check if we got a true back and stop the iter.
+        // This means we found a <base> tag and can stop processing the html.
+        if get_base_href(child, base_href) {
+            return true;
+        }
+    }
+    false
+}
+
+fn get_favicons_node(node: &std::rc::Rc<markup5ever_rcdom::Node>, icons: &mut Vec<Icon>, url: &url::Url) {
+    if let markup5ever_rcdom::NodeData::Element {
+        name,
+        attrs,
+        ..
+    } = &node.data
+    {
         if name.local.as_ref() == "link" {
             let mut has_rel = false;
             let mut href = None;
@@ -343,7 +419,8 @@ fn get_favicons_node(node: &std::rc::Rc<markup5ever_rcdom::Node>, icons: &mut Ve
                 let attr_name = attr.name.local.as_ref();
                 let attr_value = attr.value.as_ref();
 
-                if attr_name == "rel" && ICON_REL_REGEX.is_match(attr_value) {
+                if attr_name == "rel" && ICON_REL_REGEX.is_match(attr_value) && !ICON_REL_BLACKLIST.is_match(attr_value)
+                {
                     has_rel = true;
                 } else if attr_name == "href" {
                     href = Some(attr_value);
@@ -352,10 +429,12 @@ fn get_favicons_node(node: &std::rc::Rc<markup5ever_rcdom::Node>, icons: &mut Ve
                 }
             }
 
-            if has_rel && href.is_some() {
-                if let Ok(full_href) = url.join(&href.unwrap()).map(|h| h.into_string()) {
-                    let priority = get_icon_priority(&full_href, sizes);
-                    icons.push(Icon::new(priority, full_href));
+            if has_rel {
+                if let Some(inner_href) = href {
+                    if let Ok(full_href) = url.join(inner_href).map(String::from) {
+                        let priority = get_icon_priority(&full_href, sizes);
+                        icons.push(Icon::new(priority, full_href));
+                    }
                 }
             }
         }
@@ -369,12 +448,11 @@ fn get_favicons_node(node: &std::rc::Rc<markup5ever_rcdom::Node>, icons: &mut Ve
 
 struct IconUrlResult {
     iconlist: Vec<Icon>,
-    cookies: String,
     referer: String,
 }
 
-/// Returns a Result/Tuple which holds a Vector IconList and a string which holds the cookies from the last response.
-/// There will always be a result with a string which will contain https://example.com/favicon.ico and an empty string for the cookies.
+/// Returns a IconUrlResult which holds a Vector IconList and a string which holds the referer.
+/// There will always two items within the iconlist which holds http(s)://domain.tld/favicon.ico.
 /// This does not mean that that location does exists, but it is the default location browser use.
 ///
 /// # Argument
@@ -382,8 +460,8 @@ struct IconUrlResult {
 ///
 /// # Example
 /// ```
-/// let (mut iconlist, cookie_str) = get_icon_url("github.com")?;
-/// let (mut iconlist, cookie_str) = get_icon_url("gitlab.com")?;
+/// let icon_result = get_icon_url("github.com")?;
+/// let icon_result = get_icon_url("vaultwarden.discourse.group")?;
 /// ```
 fn get_icon_url(domain: &str) -> Result<IconUrlResult, Error> {
     // Default URL with secure and insecure schemes
@@ -431,49 +509,30 @@ fn get_icon_url(domain: &str) -> Result<IconUrlResult, Error> {
 
     // Create the iconlist
     let mut iconlist: Vec<Icon> = Vec::new();
-
-    // Create the cookie_str to fill it all the cookies from the response
-    // These cookies can be used to request/download the favicon image.
-    // Some sites have extra security in place with for example XSRF Tokens.
-    let mut cookie_str = "".to_string();
-    let mut referer = "".to_string();
+    let mut referer = String::from("");
 
     if let Ok(content) = resp {
         // Extract the URL from the respose in case redirects occured (like @ gitlab.com)
         let url = content.url().clone();
-
-        // Get all the cookies and pass it on to the next function.
-        // Needed for XSRF Cookies for example (like @ mijn.ing.nl)
-        let raw_cookies = content.headers().get_all("set-cookie");
-        cookie_str = raw_cookies
-            .iter()
-            .filter_map(|raw_cookie| raw_cookie.to_str().ok())
-            .map(|cookie_str| {
-                if let Ok(cookie) = Cookie::parse(cookie_str) {
-                    format!("{}={}; ", cookie.name(), cookie.value())
-                } else {
-                    String::new()
-                }
-            })
-            .collect::<String>();
 
         // Set the referer to be used on the final request, some sites check this.
         // Mostly used to prevent direct linking and other security resons.
         referer = url.as_str().to_string();
 
         // Add the default favicon.ico to the list with the domain the content responded from.
-        iconlist.push(Icon::new(35, url.join("/favicon.ico").unwrap().into_string()));
+        iconlist.push(Icon::new(35, String::from(url.join("/favicon.ico").unwrap())));
 
-        // 512KB should be more than enough for the HTML, though as we only really need
-        // the HTML header, it could potentially be reduced even further
-        let mut limited_reader = content.take(512 * 1024);
+        // 384KB should be more than enough for the HTML, though as we only really need the HTML header.
+        let mut limited_reader = content.take(384 * 1024);
 
         use html5ever::tendril::TendrilSink;
         let dom = html5ever::parse_document(markup5ever_rcdom::RcDom::default(), Default::default())
             .from_utf8()
             .read_from(&mut limited_reader)?;
-    
-        get_favicons_node(&dom.document, &mut iconlist, &url);
+
+        let mut base_url: url::Url = url;
+        get_base_href(&dom.document, &mut base_url);
+        get_favicons_node(&dom.document, &mut iconlist, &base_url);
     } else {
         // Add the default favicon.ico to the list with just the given domain
         iconlist.push(Icon::new(35, format!("{}/favicon.ico", ssldomain)));
@@ -484,33 +543,27 @@ fn get_icon_url(domain: &str) -> Result<IconUrlResult, Error> {
     iconlist.sort_by_key(|x| x.priority);
 
     // There always is an icon in the list, so no need to check if it exists, and just return the first one
-    Ok(IconUrlResult{
+    Ok(IconUrlResult {
         iconlist,
-        cookies: cookie_str,
-        referer
+        referer,
     })
 }
 
 fn get_page(url: &str) -> Result<Response, Error> {
-    get_page_with_cookies(url, "", "")
+    get_page_with_referer(url, "")
 }
 
-fn get_page_with_cookies(url: &str, cookie_str: &str, referer: &str) -> Result<Response, Error> {
-    if is_domain_blacklisted(Url::parse(url).unwrap().host_str().unwrap_or_default()) {
+fn get_page_with_referer(url: &str, referer: &str) -> Result<Response, Error> {
+    if is_domain_blacklisted(url::Url::parse(url).unwrap().host_str().unwrap_or_default()) {
         err!("Favicon rel linked to a blacklisted domain!");
     }
 
     let mut client = CLIENT.get(url);
-    if !cookie_str.is_empty() {
-        client = client.header("Cookie", cookie_str)
-    }
     if !referer.is_empty() {
         client = client.header("Referer", referer)
     }
 
-    client.send()?
-        .error_for_status()
-        .map_err(Into::into)
+    client.send()?.error_for_status().map_err(Into::into)
 }
 
 /// Returns a Integer with the priority of the type of the icon which to prefer.
@@ -538,7 +591,7 @@ fn get_icon_priority(href: &str, sizes: Option<&str>) -> u8 {
                 1
             } else if width == 64 {
                 2
-            } else if (24..=128).contains(&width) {
+            } else if (24..=192).contains(&width) {
                 3
             } else if width == 16 {
                 4
@@ -592,14 +645,15 @@ fn parse_sizes(sizes: Option<&str>) -> (u16, u16) {
     (width, height)
 }
 
-fn download_icon(domain: &str) -> Result<Vec<u8>, Error> {
+fn download_icon(domain: &str) -> Result<(Vec<u8>, Option<&str>), Error> {
     if is_domain_blacklisted(domain) {
         err!("Domain is blacklisted", domain)
     }
 
-    let icon_result = get_icon_url(&domain)?;
+    let icon_result = get_icon_url(domain)?;
 
     let mut buffer = Vec::new();
+    let mut icon_type: Option<&str> = None;
 
     use data_url::DataUrl;
 
@@ -611,29 +665,43 @@ fn download_icon(domain: &str) -> Result<Vec<u8>, Error> {
                 Ok((body, _fragment)) => {
                     // Also check if the size is atleast 67 bytes, which seems to be the smallest png i could create
                     if body.len() >= 67 {
+                        // Check if the icon type is allowed, else try an icon from the list.
+                        icon_type = get_icon_type(&body);
+                        if icon_type.is_none() {
+                            debug!("Icon from {} data:image uri, is not a valid image type", domain);
+                            continue;
+                        }
+                        info!("Extracted icon from data:image uri for {}", domain);
                         buffer = body;
                         break;
                     }
                 }
-                _ => warn!("data uri is invalid"),
+                _ => warn!("Extracted icon from data:image uri is invalid"),
             };
         } else {
-            match get_page_with_cookies(&icon.href, &icon_result.cookies, &icon_result.referer) {
+            match get_page_with_referer(&icon.href, &icon_result.referer) {
                 Ok(mut res) => {
-                    info!("Downloaded icon from {}", icon.href);
                     res.copy_to(&mut buffer)?;
+                    // Check if the icon type is allowed, else try an icon from the list.
+                    icon_type = get_icon_type(&buffer);
+                    if icon_type.is_none() {
+                        buffer.clear();
+                        debug!("Icon from {}, is not a valid image type", icon.href);
+                        continue;
+                    }
+                    info!("Downloaded icon from {}", icon.href);
                     break;
-                },
+                }
                 _ => warn!("Download failed for {}", icon.href),
             };
         }
     }
 
     if buffer.is_empty() {
-        err!("Empty response")
+        err!("Empty response downloading icon")
     }
 
-    Ok(buffer)
+    Ok((buffer, icon_type))
 }
 
 fn save_icon(path: &str, icon: &[u8]) {
@@ -645,7 +713,65 @@ fn save_icon(path: &str, icon: &[u8]) {
             create_dir_all(&CONFIG.icon_cache_folder()).expect("Error creating icon cache");
         }
         Err(e) => {
-            info!("Icon save error: {:?}", e);
+            warn!("Icon save error: {:?}", e);
         }
+    }
+}
+
+fn get_icon_type(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [137, 80, 78, 71, ..] => Some("png"),
+        [0, 0, 1, 0, ..] => Some("x-icon"),
+        [82, 73, 70, 70, ..] => Some("webp"),
+        [255, 216, 255, ..] => Some("jpeg"),
+        [71, 73, 70, 56, ..] => Some("gif"),
+        [66, 77, ..] => Some("bmp"),
+        _ => None,
+    }
+}
+
+/// This is an implementation of the default Cookie Jar from Reqwest and reqwest_cookie_store build by pfernie.
+/// The default cookie jar used by Reqwest keeps all the cookies based upon the Max-Age or Expires which could be a long time.
+/// That could be used for tracking, to prevent this we force the lifespan of the cookies to always be max two minutes.
+/// A Cookie Jar is needed because some sites force a redirect with cookies to verify if a request uses cookies or not.
+use cookie_store::CookieStore;
+#[derive(Default)]
+pub struct Jar(RwLock<CookieStore>);
+
+impl reqwest::cookie::CookieStore for Jar {
+    fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &header::HeaderValue>, url: &url::Url) {
+        use cookie::{Cookie as RawCookie, ParseError as RawCookieParseError};
+        use time::Duration;
+
+        let mut cookie_store = self.0.write().unwrap();
+        let cookies = cookie_headers.filter_map(|val| {
+            std::str::from_utf8(val.as_bytes())
+                .map_err(RawCookieParseError::from)
+                .and_then(RawCookie::parse)
+                .map(|mut c| {
+                    c.set_expires(None);
+                    c.set_max_age(Some(Duration::minutes(2)));
+                    c.into_owned()
+                })
+                .ok()
+        });
+        cookie_store.store_response_cookies(cookies, url);
+    }
+
+    fn cookies(&self, url: &url::Url) -> Option<header::HeaderValue> {
+        use bytes::Bytes;
+
+        let cookie_store = self.0.read().unwrap();
+        let s = cookie_store
+            .get_request_values(url)
+            .map(|(name, value)| format!("{}={}", name, value))
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        if s.is_empty() {
+            return None;
+        }
+
+        header::HeaderValue::from_maybe_shared(Bytes::from(s)).ok()
     }
 }

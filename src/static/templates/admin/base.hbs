@@ -4,8 +4,8 @@
     <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
     <meta name="robots" content="noindex,nofollow" />
-    <link rel="icon" type="image/png" href="{{urlpath}}/bwrs_static/shield-white.png">
-    <title>Bitwarden_rs Admin Panel</title>
+    <link rel="icon" type="image/png" href="{{urlpath}}/bwrs_static/vaultwarden-icon.png">
+    <title>Vaultwarden Admin Panel</title>
     <link rel="stylesheet" href="{{urlpath}}/bwrs_static/bootstrap.css" />
     <style>
         body {
@@ -15,21 +15,32 @@
             width: 48px;
             height: 48px;
         }
-        .navbar img {
-            height: 24px;
+        .vaultwarden-icon {
+            height: 32px;
             width: auto;
+            margin: -5px 0 0 0;
         }
     </style>
-    <script src="{{urlpath}}/bwrs_static/md5.js"></script>
     <script src="{{urlpath}}/bwrs_static/identicon.js"></script>
     <script>
+        'use strict';
+
         function reload() { window.location.reload(); }
         function msg(text, reload_page = true) {
             text && alert(text);
             reload_page && reload();
         }
-        function identicon(email) {
-            const data = new Identicon(md5(email), { size: 48, format: 'svg' });
+        async function sha256(message) {
+            // https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/digest
+            const msgUint8 = new TextEncoder().encode(message);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+            return hashHex;
+        }
+        async function identicon(email) {
+            const hash = await sha256(email);
+            const data = new Identicon(hash, { size: 48, format: 'svg' });
             return "data:image/svg+xml;base64," + data.toString();
         }
         function toggleVis(input_id) {
@@ -69,19 +80,18 @@
             });
         }
     </script>
-
 </head>
 
 <body class="bg-light">
     <nav class="navbar navbar-expand-md navbar-dark bg-dark mb-4 shadow fixed-top">
         <div class="container-xl">
-            <a class="navbar-brand" href="{{urlpath}}/admin"><img class="pr-1" src="{{urlpath}}/bwrs_static/shield-white.png">Bitwarden_rs Admin</a>
-            <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarCollapse"
+            <a class="navbar-brand" href="{{urlpath}}/admin"><img class="vaultwarden-icon" src="{{urlpath}}/bwrs_static/vaultwarden-icon.png" alt="V">aultwarden Admin</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse"
                     aria-controls="navbarCollapse" aria-expanded="false" aria-label="Toggle navigation">
                 <span class="navbar-toggler-icon"></span>
             </button>
             <div class="collapse navbar-collapse" id="navbarCollapse">
-                <ul class="navbar-nav mr-auto">
+                <ul class="navbar-nav me-auto">
                 {{#if logged_in}}
                     <li class="nav-item">
                         <a class="nav-link" href="{{urlpath}}/admin">Settings</a>
@@ -108,21 +118,23 @@
         </div>
     </nav>
 
-    {{> (page_content) }}
+    {{> (lookup this "page_content") }}
 
     <!-- This script needs to be at the bottom, else it will fail! -->
     <script>
+        'use strict';
+
         // get current URL path and assign 'active' class to the correct nav-item
-        (function () {
+        (() => {
             var pathname = window.location.pathname;
             if (pathname === "") return;
             var navItem = document.querySelectorAll('.navbar-nav .nav-item a[href="'+pathname+'"]');
             if (navItem.length === 1) {
-                navItem[0].parentElement.className = navItem[0].parentElement.className + ' active';
+                navItem[0].className = navItem[0].className + ' active';
+                navItem[0].setAttribute('aria-current', 'page');
             }
         })();
     </script>
-    <!-- This script needs to be at the bottom, else it will fail! -->
     <script src="{{urlpath}}/bwrs_static/bootstrap-native.js"></script>
 </body>
 </html>

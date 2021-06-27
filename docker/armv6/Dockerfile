@@ -11,21 +11,21 @@
 # be changed to point to a malicious image.
 #
 # To verify the current digest for a given tag name:
-# - From https://hub.docker.com/r/bitwardenrs/web-vault/tags,
+# - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull bitwardenrs/web-vault:v2.18.1b
-#     $ docker image inspect --format "{{.RepoDigests}}" bitwardenrs/web-vault:v2.18.1b
-#     [bitwardenrs/web-vault@sha256:345a509dd5482343458b672dcd69203836ffac2e5181a1c99826d9695b9cb1eb]
+#     $ docker pull vaultwarden/web-vault:v2.20.4b
+#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.20.4b
+#     [vaultwarden/web-vault@sha256:894e266d4491494dd5a8a736855a6772aa146fa14206853b11b41cf3f3f64d05]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" bitwardenrs/web-vault@sha256:345a509dd5482343458b672dcd69203836ffac2e5181a1c99826d9695b9cb1eb
-#     [bitwardenrs/web-vault:v2.18.1b]
+#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:894e266d4491494dd5a8a736855a6772aa146fa14206853b11b41cf3f3f64d05
+#     [vaultwarden/web-vault:v2.20.4b]
 #
-FROM bitwardenrs/web-vault@sha256:345a509dd5482343458b672dcd69203836ffac2e5181a1c99826d9695b9cb1eb as vault
+FROM vaultwarden/web-vault@sha256:894e266d4491494dd5a8a736855a6772aa146fa14206853b11b41cf3f3f64d05 as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.48 as build
+FROM rust:1.53 as build
 
 # Debian-based builds support multidb
 ARG DB=sqlite,mysql,postgresql
@@ -49,11 +49,7 @@ RUN sed 's/^deb/deb-src/' /etc/apt/sources.list > \
         libpq5:armel \
         libpq-dev \
         libmariadb-dev:armel \
-        libmariadb-dev-compat:armel
-
-RUN apt-get update \
-    && apt-get install -y \
-        --no-install-recommends \
+        libmariadb-dev-compat:armel \
         gcc-arm-linux-gnueabi \
     && mkdir -p ~/.cargo \
     && echo '[target.arm-unknown-linux-gnueabi]' >> ~/.cargo/config \
@@ -77,16 +73,15 @@ COPY ./build.rs ./build.rs
 # We at least need libmariadb3:amd64 installed for the x86_64 version of libmariadb.so (client)
 # We also need the libmariadb-dev-compat:amd64 but it can not be installed together with the :armel version.
 # What we can do is a force install, because nothing important is overlapping each other.
-RUN apt-get install -y --no-install-recommends libmariadb3:amd64 && \
-    apt-get download libmariadb-dev-compat:amd64 && \
-    dpkg --force-all -i ./libmariadb-dev-compat*.deb && \
-    rm -rvf ./libmariadb-dev-compat*.deb
-
-# For Diesel-RS migrations_macros to compile with PostgreSQL we need to do some magic.
-# The libpq5:armel package seems to not provide a symlink to libpq.so.5 with the name libpq.so.
-# This is only provided by the libpq-dev package which can't be installed for both arch at the same time.
-# Without this specific file the ld command will fail and compilation fails with it.
-RUN ln -sfnr /usr/lib/arm-linux-gnueabi/libpq.so.5 /usr/lib/arm-linux-gnueabi/libpq.so
+RUN apt-get install -y --no-install-recommends libmariadb3:amd64 \
+    && apt-get download libmariadb-dev-compat:amd64 \
+    && dpkg --force-all -i ./libmariadb-dev-compat*.deb \
+    && rm -rvf ./libmariadb-dev-compat*.deb \
+    # For Diesel-RS migrations_macros to compile with PostgreSQL we need to do some magic.
+    # The libpq5:armel package seems to not provide a symlink to libpq.so.5 with the name libpq.so.
+    # This is only provided by the libpq-dev package which can't be installed for both arch at the same time.
+    # Without this specific file the ld command will fail and compilation fails with it.
+    && ln -sfnr /usr/lib/arm-linux-gnueabi/libpq.so.5 /usr/lib/arm-linux-gnueabi/libpq.so
 
 ENV CC_arm_unknown_linux_gnueabi="/usr/bin/arm-linux-gnueabi-gcc"
 ENV CROSS_COMPILE="1"
@@ -97,8 +92,8 @@ RUN rustup target add arm-unknown-linux-gnueabi
 # Builds your dependencies and removes the
 # dummy project, except the target folder
 # This folder contains the compiled dependencies
-RUN cargo build --features ${DB} --release --target=arm-unknown-linux-gnueabi
-RUN find . -not -path "./target*" -delete
+RUN cargo build --features ${DB} --release --target=arm-unknown-linux-gnueabi \
+    && find . -not -path "./target*" -delete
 
 # Copies the complete project
 # To avoid copying unneeded files, use .dockerignore
@@ -120,22 +115,22 @@ ENV ROCKET_ENV "staging"
 ENV ROCKET_PORT=80
 ENV ROCKET_WORKERS=10
 
+# hadolint ignore=DL3059
 RUN [ "cross-build-start" ]
 
-# Install needed libraries
-RUN apt-get update && apt-get install -y \
+# Create data folder and Install needed libraries
+RUN mkdir /data \
+    && apt-get update && apt-get install -y \
     --no-install-recommends \
     openssl \
     ca-certificates \
     curl \
     dumb-init \
-    sqlite3 \
     libmariadb-dev-compat \
     libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir /data
-
+# hadolint ignore=DL3059
 RUN [ "cross-build-end" ]
 
 VOLUME /data
@@ -144,9 +139,10 @@ EXPOSE 3012
 
 # Copies the files from the context (Rocket.toml file and web-vault)
 # and the binary from the "build" stage to the current stage
+WORKDIR /
 COPY Rocket.toml .
 COPY --from=vault /web-vault ./web-vault
-COPY --from=build /app/target/arm-unknown-linux-gnueabi/release/bitwarden_rs .
+COPY --from=build /app/target/arm-unknown-linux-gnueabi/release/vaultwarden .
 
 COPY docker/healthcheck.sh /healthcheck.sh
 COPY docker/start.sh /start.sh
@@ -154,6 +150,5 @@ COPY docker/start.sh /start.sh
 HEALTHCHECK --interval=60s --timeout=10s CMD ["/healthcheck.sh"]
 
 # Configures the startup!
-WORKDIR /
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["/start.sh"]

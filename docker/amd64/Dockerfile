@@ -11,21 +11,21 @@
 # be changed to point to a malicious image.
 #
 # To verify the current digest for a given tag name:
-# - From https://hub.docker.com/r/bitwardenrs/web-vault/tags,
+# - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull bitwardenrs/web-vault:v2.18.1b
-#     $ docker image inspect --format "{{.RepoDigests}}" bitwardenrs/web-vault:v2.18.1b
-#     [bitwardenrs/web-vault@sha256:345a509dd5482343458b672dcd69203836ffac2e5181a1c99826d9695b9cb1eb]
+#     $ docker pull vaultwarden/web-vault:v2.20.4b
+#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.20.4b
+#     [vaultwarden/web-vault@sha256:894e266d4491494dd5a8a736855a6772aa146fa14206853b11b41cf3f3f64d05]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" bitwardenrs/web-vault@sha256:345a509dd5482343458b672dcd69203836ffac2e5181a1c99826d9695b9cb1eb
-#     [bitwardenrs/web-vault:v2.18.1b]
+#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:894e266d4491494dd5a8a736855a6772aa146fa14206853b11b41cf3f3f64d05
+#     [vaultwarden/web-vault:v2.20.4b]
 #
-FROM bitwardenrs/web-vault@sha256:345a509dd5482343458b672dcd69203836ffac2e5181a1c99826d9695b9cb1eb as vault
+FROM vaultwarden/web-vault@sha256:894e266d4491494dd5a8a736855a6772aa146fa14206853b11b41cf3f3f64d05 as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.48 as build
+FROM rust:1.53 as build
 
 # Debian-based builds support multidb
 ARG DB=sqlite,mysql,postgresql
@@ -56,8 +56,8 @@ COPY ./build.rs ./build.rs
 # Builds your dependencies and removes the
 # dummy project, except the target folder
 # This folder contains the compiled dependencies
-RUN cargo build --features ${DB} --release
-RUN find . -not -path "./target*" -delete
+RUN cargo build --features ${DB} --release \
+    && find . -not -path "./target*" -delete
 
 # Copies the complete project
 # To avoid copying unneeded files, use .dockerignore
@@ -79,28 +79,30 @@ ENV ROCKET_ENV "staging"
 ENV ROCKET_PORT=80
 ENV ROCKET_WORKERS=10
 
-# Install needed libraries
-RUN apt-get update && apt-get install -y \
+
+# Create data folder and Install needed libraries
+RUN mkdir /data \
+    && apt-get update && apt-get install -y \
     --no-install-recommends \
     openssl \
     ca-certificates \
     curl \
     dumb-init \
-    sqlite3 \
     libmariadb-dev-compat \
     libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir /data
+
 VOLUME /data
 EXPOSE 80
 EXPOSE 3012
 
 # Copies the files from the context (Rocket.toml file and web-vault)
 # and the binary from the "build" stage to the current stage
+WORKDIR /
 COPY Rocket.toml .
 COPY --from=vault /web-vault ./web-vault
-COPY --from=build /app/target/release/bitwarden_rs .
+COPY --from=build /app/target/release/vaultwarden .
 
 COPY docker/healthcheck.sh /healthcheck.sh
 COPY docker/start.sh /start.sh
@@ -108,6 +110,5 @@ COPY docker/start.sh /start.sh
 HEALTHCHECK --interval=60s --timeout=10s CMD ["/healthcheck.sh"]
 
 # Configures the startup!
-WORKDIR /
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["/start.sh"]

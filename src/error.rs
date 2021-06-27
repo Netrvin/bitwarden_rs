@@ -33,25 +33,24 @@ macro_rules! make_error {
     };
 }
 
+use diesel::r2d2::PoolError as R2d2Err;
 use diesel::result::Error as DieselErr;
 use diesel::ConnectionError as DieselConErr;
 use diesel_migrations::RunMigrationsError as DieselMigErr;
-use diesel::r2d2::PoolError as R2d2Err;
 use handlebars::RenderError as HbErr;
-use jsonwebtoken::errors::Error as JWTErr;
+use jsonwebtoken::errors::Error as JwtErr;
+use lettre::address::AddressError as AddrErr;
+use lettre::error::Error as LettreErr;
+use lettre::transport::smtp::Error as SmtpErr;
+use openssl::error::ErrorStack as SSLErr;
 use regex::Error as RegexErr;
 use reqwest::Error as ReqErr;
 use serde_json::{Error as SerdeErr, Value};
-use std::io::Error as IOErr;
-
+use std::io::Error as IoErr;
 use std::time::SystemTimeError as TimeErr;
 use u2f::u2ferror::U2fError as U2fErr;
+use webauthn_rs::error::WebauthnError as WebauthnErr;
 use yubico::yubicoerror::YubicoError as YubiErr;
-
-use lettre::address::AddressError as AddrErr;
-use lettre::error::Error as LettreErr;
-use lettre::message::mime::FromStrError as FromStrErr;
-use lettre::transport::smtp::Error as SmtpErr;
 
 #[derive(Serialize)]
 pub struct Empty {}
@@ -63,31 +62,32 @@ pub struct Empty {}
 // The second one contains the function used to obtain the response sent to the client
 make_error! {
     // Just an empty error
-    EmptyError(Empty):     _no_source, _serialize,
+    Empty(Empty):     _no_source, _serialize,
     // Used to represent err! calls
-    SimpleError(String):  _no_source,  _api_error,
+    Simple(String):  _no_source,  _api_error,
     // Used for special return values, like 2FA errors
-    JsonError(Value):     _no_source,  _serialize,
-    DbError(DieselErr):   _has_source, _api_error,
-    R2d2Error(R2d2Err):   _has_source, _api_error,
-    U2fError(U2fErr):     _has_source, _api_error,
-    SerdeError(SerdeErr): _has_source, _api_error,
-    JWTError(JWTErr):     _has_source, _api_error,
-    TemplError(HbErr):    _has_source, _api_error,
+    Json(Value):     _no_source,  _serialize,
+    Db(DieselErr):   _has_source, _api_error,
+    R2d2(R2d2Err):   _has_source, _api_error,
+    U2f(U2fErr):     _has_source, _api_error,
+    Serde(SerdeErr): _has_source, _api_error,
+    JWt(JwtErr):     _has_source, _api_error,
+    Handlebars(HbErr): _has_source, _api_error,
     //WsError(ws::Error): _has_source, _api_error,
-    IOError(IOErr):       _has_source, _api_error,
-    TimeError(TimeErr):   _has_source, _api_error,
-    ReqError(ReqErr):     _has_source, _api_error,
-    RegexError(RegexErr): _has_source, _api_error,
-    YubiError(YubiErr):   _has_source, _api_error,
+    Io(IoErr):       _has_source, _api_error,
+    Time(TimeErr):   _has_source, _api_error,
+    Req(ReqErr):     _has_source, _api_error,
+    Regex(RegexErr): _has_source, _api_error,
+    Yubico(YubiErr): _has_source, _api_error,
 
-    LettreError(LettreErr):   _has_source, _api_error,
-    AddressError(AddrErr):    _has_source, _api_error,
-    SmtpError(SmtpErr):       _has_source, _api_error,
-    FromStrError(FromStrErr): _has_source, _api_error,
+    Lettre(LettreErr): _has_source, _api_error,
+    Address(AddrErr):  _has_source, _api_error,
+    Smtp(SmtpErr):     _has_source, _api_error,
+    OpenSSL(SSLErr):   _has_source, _api_error,
 
-    DieselConError(DieselConErr): _has_source, _api_error,
-    DieselMigError(DieselMigErr): _has_source, _api_error,
+    DieselCon(DieselConErr): _has_source, _api_error,
+    DieselMig(DieselMigErr): _has_source, _api_error,
+    Webauthn(WebauthnErr):   _has_source, _api_error,
 }
 
 impl std::fmt::Debug for Error {
@@ -95,15 +95,15 @@ impl std::fmt::Debug for Error {
         match self.source() {
             Some(e) => write!(f, "{}.\n[CAUSE] {:#?}", self.message, e),
             None => match self.error {
-                ErrorKind::EmptyError(_) => Ok(()),
-                ErrorKind::SimpleError(ref s) => {
+                ErrorKind::Empty(_) => Ok(()),
+                ErrorKind::Simple(ref s) => {
                     if &self.message == s {
                         write!(f, "{}", self.message)
                     } else {
                         write!(f, "{}. {}", self.message, s)
                     }
                 }
-                ErrorKind::JsonError(_) => write!(f, "{}", self.message),
+                ErrorKind::Json(_) => write!(f, "{}", self.message),
                 _ => unreachable!(),
             },
         }
@@ -152,6 +152,7 @@ impl<S> MapResult<S> for Option<S> {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 const fn _has_source<T>(e: T) -> Option<T> {
     Some(e)
 }
@@ -190,18 +191,14 @@ use rocket::response::{self, Responder, Response};
 impl<'r> Responder<'r> for Error {
     fn respond_to(self, _: &Request) -> response::Result<'r> {
         match self.error {
-            ErrorKind::EmptyError(_) => {} // Don't print the error in this situation
-            ErrorKind::SimpleError(_) => {} // Don't print the error in this situation
+            ErrorKind::Empty(_) => {}  // Don't print the error in this situation
+            ErrorKind::Simple(_) => {} // Don't print the error in this situation
             _ => error!(target: "error", "{:#?}", self),
         };
 
         let code = Status::from_code(self.error_code).unwrap_or(Status::BadRequest);
 
-        Response::build()
-            .status(code)
-            .header(ContentType::JSON)
-            .sized_body(Cursor::new(format!("{}", self)))
-            .ok()
+        Response::build().status(code).header(ContentType::JSON).sized_body(Cursor::new(format!("{}", self))).ok()
     }
 }
 
@@ -217,6 +214,18 @@ macro_rules! err {
     ($usr_msg:expr, $log_value:expr) => {{
         error!("{}. {}", $usr_msg, $log_value);
         return Err(crate::error::Error::new($usr_msg, $log_value));
+    }};
+}
+
+#[macro_export]
+macro_rules! err_code {
+    ($msg:expr, $err_code: expr) => {{
+        error!("{}", $msg);
+        return Err(crate::error::Error::new($msg, $msg).with_code($err_code));
+    }};
+    ($usr_msg:expr, $log_value:expr, $err_code: expr) => {{
+        error!("{}. {}", $usr_msg, $log_value);
+        return Err(crate::error::Error::new($usr_msg, $log_value).with_code($err_code));
     }};
 }
 

@@ -17,11 +17,7 @@ use crate::{
 pub use crate::config::CONFIG;
 
 pub fn routes() -> Vec<Route> {
-    routes![
-        generate_authenticator,
-        activate_authenticator,
-        activate_authenticator_put,
-    ]
+    routes![generate_authenticator, activate_authenticator, activate_authenticator_put,]
 }
 
 #[post("/two-factor/get-authenticator", data = "<data>")]
@@ -118,7 +114,7 @@ pub fn validate_totp_code_str(
         _ => err!("TOTP code is not a number"),
     };
 
-    validate_totp_code(user_uuid, totp_code, secret, ip, &conn)
+    validate_totp_code(user_uuid, totp_code, secret, ip, conn)
 }
 
 pub fn validate_totp_code(user_uuid: &str, totp_code: u64, secret: &str, ip: &ClientIp, conn: &DbConn) -> EmptyResult {
@@ -129,7 +125,7 @@ pub fn validate_totp_code(user_uuid: &str, totp_code: u64, secret: &str, ip: &Cl
         Err(_) => err!("Invalid TOTP secret"),
     };
 
-    let mut twofactor = match TwoFactor::find_by_user_and_type(&user_uuid, TwoFactorType::Authenticator as i32, &conn) {
+    let mut twofactor = match TwoFactor::find_by_user_and_type(user_uuid, TwoFactorType::Authenticator as i32, conn) {
         Some(tf) => tf,
         _ => TwoFactor::new(user_uuid.to_string(), TwoFactorType::Authenticator, secret.to_string()),
     };
@@ -141,7 +137,7 @@ pub fn validate_totp_code(user_uuid: &str, totp_code: u64, secret: &str, ip: &Cl
     // The amount of steps back and forward in time
     // Also check if we need to disable time drifted TOTP codes.
     // If that is the case, we set the steps to 0 so only the current TOTP is valid.
-    let steps: i64 = if CONFIG.authenticator_disable_time_drift() { 0 } else { 1 };
+    let steps = !CONFIG.authenticator_disable_time_drift() as i64;
 
     for step in -steps..=steps {
         let time_step = current_timestamp / 30i64 + step;
@@ -160,25 +156,14 @@ pub fn validate_totp_code(user_uuid: &str, totp_code: u64, secret: &str, ip: &Cl
             // Save the last used time step so only totp time steps higher then this one are allowed.
             // This will also save a newly created twofactor if the code is correct.
             twofactor.last_used = time_step as i32;
-            twofactor.save(&conn)?;
+            twofactor.save(conn)?;
             return Ok(());
         } else if generated == totp_code && time_step <= twofactor.last_used as i64 {
-            warn!(
-                "This or a TOTP code within {} steps back and forward has already been used!",
-                steps
-            );
-            err!(format!(
-                "Invalid TOTP code! Server time: {} IP: {}",
-                current_time.format("%F %T UTC"),
-                ip.ip
-            ));
+            warn!("This or a TOTP code within {} steps back and forward has already been used!", steps);
+            err!(format!("Invalid TOTP code! Server time: {} IP: {}", current_time.format("%F %T UTC"), ip.ip));
         }
     }
 
     // Else no valide code received, deny access
-    err!(format!(
-        "Invalid TOTP code! Server time: {} IP: {}",
-        current_time.format("%F %T UTC"),
-        ip.ip
-    ));
+    err!(format!("Invalid TOTP code! Server time: {} IP: {}", current_time.format("%F %T UTC"), ip.ip));
 }

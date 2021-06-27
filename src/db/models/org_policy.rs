@@ -1,13 +1,15 @@
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::api::EmptyResult;
 use crate::db::DbConn;
 use crate::error::MapResult;
+use crate::util::UpCase;
 
-use super::{Organization, UserOrgStatus};
+use super::{Organization, UserOrgStatus, UserOrgType, UserOrganization};
 
 db_object! {
-    #[derive(Debug, Identifiable, Queryable, Insertable, Associations, AsChangeset)]
+    #[derive(Identifiable, Queryable, Insertable, Associations, AsChangeset)]
     #[table_name = "org_policies"]
     #[belongs_to(Organization, foreign_key = "org_uuid")]
     #[primary_key(uuid)]
@@ -20,8 +22,7 @@ db_object! {
     }
 }
 
-#[allow(dead_code)]
-#[derive(num_derive::FromPrimitive)]
+#[derive(Copy, Clone, num_derive::FromPrimitive)]
 pub enum OrgPolicyType {
     TwoFactorAuthentication = 0,
     MasterPassword = 1,
@@ -29,6 +30,15 @@ pub enum OrgPolicyType {
     // SingleOrg = 3, // Not currently supported.
     // RequireSso = 4, // Not currently supported.
     PersonalOwnership = 5,
+    DisableSend = 6,
+    SendOptions = 7,
+}
+
+// https://github.com/bitwarden/server/blob/master/src/Core/Models/Data/SendOptionsPolicyData.cs
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+pub struct SendOptionsPolicyData {
+    pub DisableHideEmail: bool,
 }
 
 /// Local methods
@@ -168,6 +178,48 @@ impl OrgPolicy {
                 .execute(conn)
                 .map_res("Error deleting org_policy")
         }}
+    }
+
+    /// Returns true if the user belongs to an org that has enabled the specified policy type,
+    /// and the user is not an owner or admin of that org. This is only useful for checking
+    /// applicability of policy types that have these particular semantics.
+    pub fn is_applicable_to_user(user_uuid: &str, policy_type: OrgPolicyType, conn: &DbConn) -> bool {
+        // Returns confirmed users only.
+        for policy in OrgPolicy::find_by_user(user_uuid, conn) {
+            if policy.enabled && policy.has_type(policy_type) {
+                let org_uuid = &policy.org_uuid;
+                if let Some(user) = UserOrganization::find_by_user_and_org(user_uuid, org_uuid, conn) {
+                    if user.atype < UserOrgType::Admin {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Returns true if the user belongs to an org that has enabled the `DisableHideEmail`
+    /// option of the `Send Options` policy, and the user is not an owner or admin of that org.
+    pub fn is_hide_email_disabled(user_uuid: &str, conn: &DbConn) -> bool {
+        // Returns confirmed users only.
+        for policy in OrgPolicy::find_by_user(user_uuid, conn) {
+            if policy.enabled && policy.has_type(OrgPolicyType::SendOptions) {
+                let org_uuid = &policy.org_uuid;
+                if let Some(user) = UserOrganization::find_by_user_and_org(user_uuid, org_uuid, conn) {
+                    if user.atype < UserOrgType::Admin {
+                        match serde_json::from_str::<UpCase<SendOptionsPolicyData>>(&policy.data) {
+                            Ok(opts) => {
+                                if opts.data.DisableHideEmail {
+                                    return true;
+                                }
+                            }
+                            _ => error!("Failed to deserialize policy data: {}", policy.data),
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /*pub fn delete_all_by_user(user_uuid: &str, conn: &DbConn) -> EmptyResult {

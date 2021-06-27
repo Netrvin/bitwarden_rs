@@ -1,4 +1,4 @@
-use std::{str::FromStr};
+use std::str::FromStr;
 
 use chrono::{DateTime, Local};
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
@@ -27,13 +27,13 @@ fn mailer() -> SmtpTransport {
         .timeout(Some(Duration::from_secs(CONFIG.smtp_timeout())));
 
     // Determine security
-    let smtp_client = if CONFIG.smtp_ssl() {
+    let smtp_client = if CONFIG.smtp_ssl() || CONFIG.smtp_explicit_tls() {
         let mut tls_parameters = TlsParameters::builder(host);
         if CONFIG.smtp_accept_invalid_hostnames() {
-            tls_parameters.dangerous_accept_invalid_hostnames(true);
+            tls_parameters = tls_parameters.dangerous_accept_invalid_hostnames(true);
         }
         if CONFIG.smtp_accept_invalid_certs() {
-            tls_parameters.dangerous_accept_invalid_certs(true);
+            tls_parameters = tls_parameters.dangerous_accept_invalid_certs(true);
         }
         let tls_parameters = tls_parameters.build().unwrap();
 
@@ -58,15 +58,17 @@ fn mailer() -> SmtpTransport {
 
     let smtp_client = match CONFIG.smtp_auth_mechanism() {
         Some(mechanism) => {
-            let allowed_mechanisms = vec![SmtpAuthMechanism::Plain, SmtpAuthMechanism::Login, SmtpAuthMechanism::Xoauth2];
+            let allowed_mechanisms = [SmtpAuthMechanism::Plain, SmtpAuthMechanism::Login, SmtpAuthMechanism::Xoauth2];
             let mut selected_mechanisms = vec![];
             for wanted_mechanism in mechanism.split(',') {
                 for m in &allowed_mechanisms {
-                    if m.to_string().to_lowercase() == wanted_mechanism.trim_matches(|c| c == '"' || c == '\'' || c == ' ').to_lowercase() {
+                    if m.to_string().to_lowercase()
+                        == wanted_mechanism.trim_matches(|c| c == '"' || c == '\'' || c == ' ').to_lowercase()
+                    {
                         selected_mechanisms.push(*m);
                     }
                 }
-            };
+            }
 
             if !selected_mechanisms.is_empty() {
                 smtp_client.authentication(selected_mechanisms)
@@ -97,9 +99,8 @@ fn get_template(template_name: &str, data: &serde_json::Value) -> Result<(String
         None => err!("Template doesn't contain subject"),
     };
 
-    use newline_converter::unix2dos;
     let body = match text_split.next() {
-        Some(s) => unix2dos(s.trim()).to_string(),
+        Some(s) => s.trim().to_string(),
         None => err!("Template doesn't contain body"),
     };
 
@@ -115,7 +116,7 @@ pub fn send_password_hint(address: &str, hint: Option<String>) -> EmptyResult {
 
     let (subject, body_html, body_text) = get_text(template_name, json!({ "hint": hint, "url": CONFIG.domain() }))?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
 pub fn send_delete_account(address: &str, uuid: &str) -> EmptyResult {
@@ -132,7 +133,7 @@ pub fn send_delete_account(address: &str, uuid: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
 pub fn send_verify_email(address: &str, uuid: &str) -> EmptyResult {
@@ -149,7 +150,7 @@ pub fn send_verify_email(address: &str, uuid: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
 pub fn send_welcome(address: &str) -> EmptyResult {
@@ -160,7 +161,7 @@ pub fn send_welcome(address: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
 pub fn send_welcome_must_verify(address: &str, uuid: &str) -> EmptyResult {
@@ -176,7 +177,7 @@ pub fn send_welcome_must_verify(address: &str, uuid: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
 pub fn send_invite(
@@ -200,15 +201,15 @@ pub fn send_invite(
         "email/send_org_invite",
         json!({
             "url": CONFIG.domain(),
-            "org_id": org_id.unwrap_or_else(|| "_".to_string()),
-            "org_user_id": org_user_id.unwrap_or_else(|| "_".to_string()),
+            "org_id": org_id.as_deref().unwrap_or("_"),
+            "org_user_id": org_user_id.as_deref().unwrap_or("_"),
             "email": percent_encode(address.as_bytes(), NON_ALPHANUMERIC).to_string(),
             "org_name": org_name,
             "token": invite_token,
         }),
     )?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
 pub fn send_invite_accepted(new_user_email: &str, address: &str, org_name: &str) -> EmptyResult {
@@ -221,7 +222,7 @@ pub fn send_invite_accepted(new_user_email: &str, address: &str, org_name: &str)
         }),
     )?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
 pub fn send_invite_confirmed(address: &str, org_name: &str) -> EmptyResult {
@@ -233,7 +234,7 @@ pub fn send_invite_confirmed(address: &str, org_name: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
 pub fn send_new_device_logged_in(address: &str, ip: &str, dt: &DateTime<Local>, device: &str) -> EmptyResult {
@@ -251,7 +252,7 @@ pub fn send_new_device_logged_in(address: &str, ip: &str, dt: &DateTime<Local>, 
         }),
     )?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
 pub fn send_token(address: &str, token: &str) -> EmptyResult {
@@ -263,7 +264,7 @@ pub fn send_token(address: &str, token: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
 pub fn send_change_email(address: &str, token: &str) -> EmptyResult {
@@ -275,7 +276,7 @@ pub fn send_change_email(address: &str, token: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
 pub fn send_test(address: &str) -> EmptyResult {
@@ -286,10 +287,10 @@ pub fn send_test(address: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(address, &subject, &body_html, &body_text)
+    send_email(address, &subject, body_html, body_text)
 }
 
-fn send_email(address: &str, subject: &str, body_html: &str, body_text: &str) -> EmptyResult {
+fn send_email(address: &str, subject: &str, body_html: String, body_text: String) -> EmptyResult {
     let address_split: Vec<&str> = address.rsplitn(2, '@').collect();
     if address_split.len() != 2 {
         err!("Invalid email address (no @)");
@@ -305,48 +306,38 @@ fn send_email(address: &str, subject: &str, body_html: &str, body_text: &str) ->
     let html = SinglePart::builder()
         // We force Base64 encoding because in the past we had issues with different encodings.
         .header(header::ContentTransferEncoding::Base64)
-        .header(header::ContentType("text/html; charset=utf-8".parse()?))
-        .body(String::from(body_html));
+        .header(header::ContentType::TEXT_HTML)
+        .body(body_html);
 
     let text = SinglePart::builder()
         // We force Base64 encoding because in the past we had issues with different encodings.
         .header(header::ContentTransferEncoding::Base64)
-        .header(header::ContentType("text/plain; charset=utf-8".parse()?))
-        .body(String::from(body_text));
+        .header(header::ContentType::TEXT_PLAIN)
+        .body(body_text);
 
     let smtp_from = &CONFIG.smtp_from();
     let email = Message::builder()
-        .message_id(Some(format!("<{}@{}>", crate::util::get_uuid(), smtp_from.split('@').collect::<Vec<&str>>()[1] )))
+        .message_id(Some(format!("<{}@{}>", crate::util::get_uuid(), smtp_from.split('@').collect::<Vec<&str>>()[1])))
         .to(Mailbox::new(None, Address::from_str(&address)?))
-        .from(Mailbox::new(
-            Some(CONFIG.smtp_from_name()),
-            Address::from_str(smtp_from)?,
-        ))
+        .from(Mailbox::new(Some(CONFIG.smtp_from_name()), Address::from_str(smtp_from)?))
         .subject(subject)
-        .multipart(
-            MultiPart::alternative()
-                .singlepart(text)
-                .singlepart(html)
-        )?;
+        .multipart(MultiPart::alternative().singlepart(text).singlepart(html))?;
 
     match mailer().send(&email) {
         Ok(_) => Ok(()),
         // Match some common errors and make them more user friendly
-        Err(e) => match e {
-            lettre::transport::smtp::Error::Client(x) => {
-                err!(format!("SMTP Client error: {}", x));
-            },
-            lettre::transport::smtp::Error::Transient(x) => {
-                err!(format!("SMTP 4xx error: {:?}", x.message));
-            },
-            lettre::transport::smtp::Error::Permanent(x) => {
-                err!(format!("SMTP 5xx error: {:?}", x.message));
-            },
-            lettre::transport::smtp::Error::Io(x) => {
-                err!(format!("SMTP IO error: {}", x));
-            },
-            // Fallback for all other errors
-            _ => Err(e.into())
+        Err(e) => {
+            if e.is_client() {
+                err!(format!("SMTP Client error: {}", e));
+            } else if e.is_transient() {
+                err!(format!("SMTP 4xx error: {:?}", e));
+            } else if e.is_permanent() {
+                err!(format!("SMTP 5xx error: {:?}", e));
+            } else if e.is_timeout() {
+                err!(format!("SMTP timeout error: {:?}", e));
+            } else {
+                Err(e.into())
+            }
         }
     }
 }

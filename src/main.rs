@@ -16,14 +16,8 @@ extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
 
-use std::{
-    fs::create_dir_all,
-    panic,
-    path::Path,
-    process::{exit, Command},
-    str::FromStr,
-    thread,
-};
+use job_scheduler::{Job, JobScheduler};
+use std::{fs::create_dir_all, panic, path::Path, process::exit, str::FromStr, thread, time::Duration};
 
 #[macro_use]
 mod error;
@@ -38,6 +32,7 @@ mod util;
 
 pub use config::CONFIG;
 pub use error::{Error, MapResult};
+pub use util::is_running_in_docker;
 
 fn main() {
     parse_args();
@@ -47,25 +42,30 @@ fn main() {
     let level = LF::from_str(&CONFIG.log_level()).expect("Valid log level");
     init_logging(level).ok();
 
-    let extra_debug = match level {
-        LF::Trace | LF::Debug => true,
-        _ => false,
-    };
+    let extra_debug = matches!(level, LF::Trace | LF::Debug);
 
-    check_rsa_keys();
+    check_data_folder();
+    check_rsa_keys().unwrap_or_else(|_| {
+        error!("Error creating keys, exiting...");
+        exit(1);
+    });
     check_web_vault();
 
     create_icon_cache_folder();
 
-    launch_rocket(extra_debug);
+    let pool = create_db_pool();
+    schedule_jobs(pool.clone());
+    crate::db::models::TwoFactor::migrate_u2f_to_webauthn(&pool.get().unwrap()).unwrap();
+
+    launch_rocket(pool, extra_debug); // Blocks until program termination.
 }
 
 const HELP: &str = "\
-        A Bitwarden API server written in Rust
-        
+        Alternative implementation of the Bitwarden server API written in Rust
+
         USAGE:
-            bitwarden_rs
-        
+            vaultwarden
+
         FLAGS:
             -h, --help       Prints help information
             -v, --version    Prints the app version
@@ -76,18 +76,18 @@ fn parse_args() {
     let mut pargs = pico_args::Arguments::from_env();
 
     if pargs.contains(["-h", "--help"]) {
-        println!("bitwarden_rs {}", option_env!("BWRS_VERSION").unwrap_or(NO_VERSION));
+        println!("vaultwarden {}", option_env!("BWRS_VERSION").unwrap_or(NO_VERSION));
         print!("{}", HELP);
         exit(0);
     } else if pargs.contains(["-v", "--version"]) {
-        println!("bitwarden_rs {}", option_env!("BWRS_VERSION").unwrap_or(NO_VERSION));
+        println!("vaultwarden {}", option_env!("BWRS_VERSION").unwrap_or(NO_VERSION));
         exit(0);
     }
 }
 
 fn launch_info() {
     println!("/--------------------------------------------------------------------\\");
-    println!("|                       Starting Bitwarden_RS                        |");
+    println!("|                        Starting Vaultwarden                        |");
 
     if let Some(version) = option_env!("BWRS_VERSION") {
         println!("|{:^68}|", format!("Version {}", version));
@@ -97,9 +97,9 @@ fn launch_info() {
     println!("| This is an *unofficial* Bitwarden implementation, DO NOT use the   |");
     println!("| official channels to report bugs/features, regardless of client.   |");
     println!("| Send usage/configuration questions or feature requests to:         |");
-    println!("|   https://bitwardenrs.discourse.group/                             |");
+    println!("|   https://vaultwarden.discourse.group/                             |");
     println!("| Report suspected bugs/issues in the software itself at:            |");
-    println!("|   https://github.com/dani-garcia/bitwarden_rs/issues/new           |");
+    println!("|   https://github.com/dani-garcia/vaultwarden/issues/new            |");
     println!("\\--------------------------------------------------------------------/\n");
 }
 
@@ -119,12 +119,17 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
         // Never show html5ever and hyper::proto logs, too noisy
         .level_for("html5ever", log::LevelFilter::Off)
         .level_for("hyper::proto", log::LevelFilter::Off)
+        .level_for("hyper::client", log::LevelFilter::Off)
+        // Prevent cookie_store logs
+        .level_for("cookie_store", log::LevelFilter::Off)
         .chain(std::io::stdout());
 
     // Enable smtp debug logging only specifically for smtp when need.
     // This can contain sensitive information we do not want in the default debug/trace logging.
     if CONFIG.smtp_debug() {
-        println!("[WARNING] SMTP Debugging is enabled (SMTP_DEBUG=true). Sensitive information could be disclosed via logs!");
+        println!(
+            "[WARNING] SMTP Debugging is enabled (SMTP_DEBUG=true). Sensitive information could be disclosed via logs!"
+        );
         println!("[WARNING] Only enable SMTP_DEBUG during troubleshooting!\n");
         logger = logger.level_for("lettre::transport::smtp", log::LevelFilter::Debug)
     } else {
@@ -202,7 +207,7 @@ fn chain_syslog(logger: fern::Dispatch) -> fern::Dispatch {
     let syslog_fmt = syslog::Formatter3164 {
         facility: syslog::Facility::LOG_USER,
         hostname: None,
-        process: "bitwarden_rs".into(),
+        process: "vaultwarden".into(),
         pid: 0,
     };
 
@@ -215,57 +220,53 @@ fn chain_syslog(logger: fern::Dispatch) -> fern::Dispatch {
     }
 }
 
-fn create_icon_cache_folder() {
-    // Try to create the icon cache folder, and generate an error if it could not.
-    create_dir_all(&CONFIG.icon_cache_folder()).expect("Error creating icon cache directory");
+fn create_dir(path: &str, description: &str) {
+    // Try to create the specified dir, if it doesn't already exist.
+    let err_msg = format!("Error creating {} directory '{}'", description, path);
+    create_dir_all(path).expect(&err_msg);
 }
 
-fn check_rsa_keys() {
-    // If the RSA keys don't exist, try to create them
-    if !util::file_exists(&CONFIG.private_rsa_key()) || !util::file_exists(&CONFIG.public_rsa_key()) {
-        info!("JWT keys don't exist, checking if OpenSSL is available...");
+fn create_icon_cache_folder() {
+    create_dir(&CONFIG.icon_cache_folder(), "icon cache");
+}
 
-        Command::new("openssl").arg("version").status().unwrap_or_else(|_| {
-            info!(
-                "Can't create keys because OpenSSL is not available, make sure it's installed and available on the PATH"
-            );
-            exit(1);
-        });
-
-        info!("OpenSSL detected, creating keys...");
-
-        let key = CONFIG.rsa_key_filename();
-
-        let pem = format!("{}.pem", key);
-        let priv_der = format!("{}.der", key);
-        let pub_der = format!("{}.pub.der", key);
-
-        let mut success = Command::new("openssl")
-            .args(&["genrsa", "-out", &pem])
-            .status()
-            .expect("Failed to create private pem file")
-            .success();
-
-        success &= Command::new("openssl")
-            .args(&["rsa", "-in", &pem, "-outform", "DER", "-out", &priv_der])
-            .status()
-            .expect("Failed to create private der file")
-            .success();
-
-        success &= Command::new("openssl")
-            .args(&["rsa", "-in", &priv_der, "-inform", "DER"])
-            .args(&["-RSAPublicKey_out", "-outform", "DER", "-out", &pub_der])
-            .status()
-            .expect("Failed to create public der file")
-            .success();
-
-        if success {
-            info!("Keys created correctly.");
+fn check_data_folder() {
+    let data_folder = &CONFIG.data_folder();
+    let path = Path::new(data_folder);
+    if !path.exists() {
+        error!("Data folder '{}' doesn't exist.", data_folder);
+        if is_running_in_docker() {
+            error!("Verify that your data volume is mounted at the correct location.");
         } else {
-            error!("Error creating keys, exiting...");
-            exit(1);
+            error!("Create the data folder and try again.");
         }
+        exit(1);
     }
+}
+
+fn check_rsa_keys() -> Result<(), crate::error::Error> {
+    // If the RSA keys don't exist, try to create them
+    let priv_path = CONFIG.private_rsa_key();
+    let pub_path = CONFIG.public_rsa_key();
+
+    if !util::file_exists(&priv_path) {
+        let rsa_key = openssl::rsa::Rsa::generate(2048)?;
+
+        let priv_key = rsa_key.private_key_to_pem()?;
+        crate::util::write_file(&priv_path, &priv_key)?;
+        info!("Private key created correctly.");
+    }
+
+    if !util::file_exists(&pub_path) {
+        let rsa_key = openssl::rsa::Rsa::private_key_from_pem(&util::read_file(&priv_path)?)?;
+
+        let pub_key = rsa_key.public_key_to_pem()?;
+        crate::util::write_file(&pub_path, &pub_key)?;
+        info!("Public key created correctly.");
+    }
+
+    auth::load_keys();
+    Ok(())
 }
 
 fn check_web_vault() {
@@ -276,22 +277,27 @@ fn check_web_vault() {
     let index_path = Path::new(&CONFIG.web_vault_folder()).join("index.html");
 
     if !index_path.exists() {
-        error!("Web vault is not found at '{}'. To install it, please follow the steps in: ", CONFIG.web_vault_folder());
-        error!("https://github.com/dani-garcia/bitwarden_rs/wiki/Building-binary#install-the-web-vault");
+        error!(
+            "Web vault is not found at '{}'. To install it, please follow the steps in: ",
+            CONFIG.web_vault_folder()
+        );
+        error!("https://github.com/dani-garcia/vaultwarden/wiki/Building-binary#install-the-web-vault");
         error!("You can also set the environment variable 'WEB_VAULT_ENABLED=false' to disable it");
         exit(1);
     }
 }
 
-fn launch_rocket(extra_debug: bool) {
-    let pool = match util::retry_db(db::DbPool::from_config, CONFIG.db_connection_retries()) {
+fn create_db_pool() -> db::DbPool {
+    match util::retry_db(db::DbPool::from_config, CONFIG.db_connection_retries()) {
         Ok(p) => p,
         Err(e) => {
             error!("Error creating database pool: {:?}", e);
             exit(1);
         }
-    };
+    }
+}
 
+fn launch_rocket(pool: db::DbPool, extra_debug: bool) {
     let basepath = &CONFIG.domain_path();
 
     // If adding more paths here, consider also adding them to
@@ -306,11 +312,48 @@ fn launch_rocket(extra_debug: bool) {
         .manage(pool)
         .manage(api::start_notification_server())
         .attach(util::AppHeaders())
-        .attach(util::CORS())
+        .attach(util::Cors())
         .attach(util::BetterLogging(extra_debug))
         .launch();
 
     // Launch and print error if there is one
     // The launch will restore the original logging level
     error!("Launch error {:#?}", result);
+}
+
+fn schedule_jobs(pool: db::DbPool) {
+    if CONFIG.job_poll_interval_ms() == 0 {
+        info!("Job scheduler disabled.");
+        return;
+    }
+    thread::Builder::new()
+        .name("job-scheduler".to_string())
+        .spawn(move || {
+            let mut sched = JobScheduler::new();
+
+            // Purge sends that are past their deletion date.
+            if !CONFIG.send_purge_schedule().is_empty() {
+                sched.add(Job::new(CONFIG.send_purge_schedule().parse().unwrap(), || {
+                    api::purge_sends(pool.clone());
+                }));
+            }
+
+            // Purge trashed items that are old enough to be auto-deleted.
+            if !CONFIG.trash_purge_schedule().is_empty() {
+                sched.add(Job::new(CONFIG.trash_purge_schedule().parse().unwrap(), || {
+                    api::purge_trashed_ciphers(pool.clone());
+                }));
+            }
+
+            // Periodically check for jobs to run. We probably won't need any
+            // jobs that run more often than once a minute, so a default poll
+            // interval of 30 seconds should be sufficient. Users who want to
+            // schedule jobs to run more frequently for some reason can reduce
+            // the poll interval accordingly.
+            loop {
+                sched.tick();
+                thread::sleep(Duration::from_millis(CONFIG.job_poll_interval_ms()));
+            }
+        })
+        .expect("Error spawning job scheduler thread");
 }

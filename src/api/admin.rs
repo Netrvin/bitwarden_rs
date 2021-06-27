@@ -1,11 +1,10 @@
 use once_cell::sync::Lazy;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::{env, process::Command, time::Duration};
+use std::{env, time::Duration};
 
-use reqwest::{blocking::Client, header::USER_AGENT};
 use rocket::{
-    http::{Cookie, Cookies, SameSite},
+    http::{Cookie, Cookies, SameSite, Status},
     request::{self, FlashMessage, Form, FromRequest, Outcome, Request},
     response::{content::Html, Flash, Redirect},
     Route,
@@ -16,10 +15,10 @@ use crate::{
     api::{ApiResult, EmptyResult, JsonResult, NumberOrString},
     auth::{decode_admin, encode_jwt, generate_admin_claims, ClientIp},
     config::ConfigBuilder,
-    db::{backup_database, models::*, DbConn, DbConnType},
+    db::{backup_database, get_sql_server_version, models::*, DbConn, DbConnType},
     error::{Error, MapResult},
     mail,
-    util::{format_naive_datetime_local, get_display_size},
+    util::{format_naive_datetime_local, get_display_size, get_reqwest_client, is_running_in_docker},
     CONFIG,
 };
 
@@ -31,6 +30,7 @@ pub fn routes() -> Vec<Route> {
     routes![
         admin_login,
         get_users_json,
+        get_user_json,
         post_admin_login,
         admin_page,
         invite_user,
@@ -64,12 +64,8 @@ static DB_TYPE: Lazy<&str> = Lazy::new(|| {
         .unwrap_or("Unknown")
 });
 
-static CAN_BACKUP: Lazy<bool> = Lazy::new(|| {
-    DbConnType::from_url(&CONFIG.database_url())
-        .map(|t| t == DbConnType::sqlite)
-        .unwrap_or(false)
-        && Command::new("sqlite3").arg("-version").status().is_ok()
-});
+static CAN_BACKUP: Lazy<bool> =
+    Lazy::new(|| DbConnType::from_url(&CONFIG.database_url()).map(|t| t == DbConnType::sqlite).unwrap_or(false));
 
 #[get("/")]
 fn admin_disabled() -> &'static str {
@@ -93,6 +89,27 @@ impl<'a, 'r> FromRequest<'a, 'r> for Referer {
 
     fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
         Outcome::Success(Referer(request.headers().get_one("Referer").map(str::to_string)))
+    }
+}
+
+#[derive(Debug)]
+struct IpHeader(Option<String>);
+
+impl<'a, 'r> FromRequest<'a, 'r> for IpHeader {
+    type Error = ();
+
+    fn from_request(req: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+        if req.headers().get_one(&CONFIG.ip_header()).is_some() {
+            Outcome::Success(IpHeader(Some(CONFIG.ip_header())))
+        } else if req.headers().get_one("X-Client-IP").is_some() {
+            Outcome::Success(IpHeader(Some(String::from("X-Client-IP"))))
+        } else if req.headers().get_one("X-Real-IP").is_some() {
+            Outcome::Success(IpHeader(Some(String::from("X-Real-IP"))))
+        } else if req.headers().get_one("X-Forwarded-For").is_some() {
+            Outcome::Success(IpHeader(Some(String::from("X-Forwarded-For"))))
+        } else {
+            Outcome::Success(IpHeader(None))
+        }
     }
 }
 
@@ -121,7 +138,12 @@ fn admin_url(referer: Referer) -> String {
 fn admin_login(flash: Option<FlashMessage>) -> ApiResult<Html<String>> {
     // If there is an error, show it
     let msg = flash.map(|msg| format!("{}: {}", msg.name(), msg.msg()));
-    let json = json!({"page_content": "admin/login", "version": VERSION, "error": msg, "urlpath": CONFIG.domain_path()});
+    let json = json!({
+        "page_content": "admin/login",
+        "version": VERSION,
+        "error": msg,
+        "urlpath": CONFIG.domain_path()
+    });
 
     // Return the page
     let text = CONFIG.render_template(BASE_TEMPLATE, &json)?;
@@ -145,10 +167,7 @@ fn post_admin_login(
     // If the token is invalid, redirect to login page
     if !_validate_token(&data.token) {
         error!("Invalid admin token. IP: {}", ip.ip);
-        Err(Flash::error(
-            Redirect::to(admin_url(referer)),
-            "Invalid admin token, please try again.",
-        ))
+        Err(Flash::error(Redirect::to(admin_url(referer)), "Invalid admin token, please try again."))
     } else {
         // If the token received is valid, generate JWT and save it as a cookie
         let claims = generate_admin_claims();
@@ -177,9 +196,7 @@ fn _validate_token(token: &str) -> bool {
 struct AdminTemplateData {
     page_content: String,
     version: Option<&'static str>,
-    users: Option<Vec<Value>>,
-    organizations: Option<Vec<Value>>,
-    diagnostics: Option<Value>,
+    page_data: Option<Value>,
     config: Value,
     can_backup: bool,
     logged_in: bool,
@@ -195,51 +212,19 @@ impl AdminTemplateData {
             can_backup: *CAN_BACKUP,
             logged_in: true,
             urlpath: CONFIG.domain_path(),
-            users: None,
-            organizations: None,
-            diagnostics: None,
+            page_data: None,
         }
     }
 
-    fn users(users: Vec<Value>) -> Self {
+    fn with_data(page_content: &str, page_data: Value) -> Self {
         Self {
-            page_content: String::from("admin/users"),
+            page_content: String::from(page_content),
             version: VERSION,
-            users: Some(users),
+            page_data: Some(page_data),
             config: CONFIG.prepare_json(),
             can_backup: *CAN_BACKUP,
             logged_in: true,
             urlpath: CONFIG.domain_path(),
-            organizations: None,
-            diagnostics: None,
-        }
-    }
-
-    fn organizations(organizations: Vec<Value>) -> Self {
-        Self {
-            page_content: String::from("admin/organizations"),
-            version: VERSION,
-            organizations: Some(organizations),
-            config: CONFIG.prepare_json(),
-            can_backup: *CAN_BACKUP,
-            logged_in: true,
-            urlpath: CONFIG.domain_path(),
-            users: None,
-            diagnostics: None,
-        }
-    }
-
-    fn diagnostics(diagnostics: Value) -> Self {
-        Self {
-            page_content: String::from("admin/diagnostics"),
-            version: VERSION,
-            organizations: None,
-            config: CONFIG.prepare_json(),
-            can_backup: *CAN_BACKUP,
-            logged_in: true,
-            urlpath: CONFIG.domain_path(),
-            users: None,
-            diagnostics: Some(diagnostics),
         }
     }
 
@@ -260,23 +245,39 @@ struct InviteData {
     email: String,
 }
 
+fn get_user_or_404(uuid: &str, conn: &DbConn) -> ApiResult<User> {
+    if let Some(user) = User::find_by_uuid(uuid, conn) {
+        Ok(user)
+    } else {
+        err_code!("User doesn't exist", Status::NotFound.code);
+    }
+}
+
 #[post("/invite", data = "<data>")]
-fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -> EmptyResult {
+fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -> JsonResult {
     let data: InviteData = data.into_inner();
     let email = data.email.clone();
     if User::find_by_mail(&data.email, &conn).is_some() {
-        err!("User already exists")
+        err_code!("User already exists", Status::Conflict.code)
     }
 
     let mut user = User::new(email);
-    user.save(&conn)?;
 
-    if CONFIG.mail_enabled() {
-        mail::send_invite(&user.email, &user.uuid, None, None, &CONFIG.invitation_org_name(), None)
-    } else {
-        let invitation = Invitation::new(data.email);
-        invitation.save(&conn)
-    }
+    // TODO: After try_blocks is stabilized, this can be made more readable
+    // See: https://github.com/rust-lang/rust/issues/31436
+    (|| {
+        if CONFIG.mail_enabled() {
+            mail::send_invite(&user.email, &user.uuid, None, None, &CONFIG.invitation_org_name(), None)?;
+        } else {
+            let invitation = Invitation::new(data.email);
+            invitation.save(&conn)?;
+        }
+
+        user.save(&conn)
+    })()
+    .map_err(|e| e.with_code(Status::InternalServerError.code))?;
+
+    Ok(Json(user.to_json(&conn)))
 }
 
 #[post("/test/smtp", data = "<data>")]
@@ -291,24 +292,25 @@ fn test_smtp(data: Json<InviteData>, _token: AdminToken) -> EmptyResult {
 }
 
 #[get("/logout")]
-fn logout(mut cookies: Cookies, referer: Referer) -> Result<Redirect, ()> {
+fn logout(mut cookies: Cookies, referer: Referer) -> Redirect {
     cookies.remove(Cookie::named(COOKIE_NAME));
-    Ok(Redirect::to(admin_url(referer)))
+    Redirect::to(admin_url(referer))
 }
 
 #[get("/users")]
-fn get_users_json(_token: AdminToken, conn: DbConn) -> JsonResult {
+fn get_users_json(_token: AdminToken, conn: DbConn) -> Json<Value> {
     let users = User::get_all(&conn);
     let users_json: Vec<Value> = users.iter().map(|u| u.to_json(&conn)).collect();
 
-    Ok(Json(Value::Array(users_json)))
+    Json(Value::Array(users_json))
 }
 
 #[get("/users/overview")]
 fn users_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<String>> {
     let users = User::get_all(&conn);
     let dt_fmt = "%Y-%m-%d %H:%M:%S %Z";
-    let users_json: Vec<Value> = users.iter()
+    let users_json: Vec<Value> = users
+        .iter()
         .map(|u| {
             let mut usr = u.to_json(&conn);
             usr["cipher_count"] = json!(Cipher::count_owned_by_user(&u.uuid, &conn));
@@ -318,25 +320,32 @@ fn users_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<String>> {
             usr["created_at"] = json!(format_naive_datetime_local(&u.created_at, dt_fmt));
             usr["last_active"] = match u.last_active(&conn) {
                 Some(dt) => json!(format_naive_datetime_local(&dt, dt_fmt)),
-                None => json!("Never")
+                None => json!("Never"),
             };
             usr
         })
         .collect();
 
-    let text = AdminTemplateData::users(users_json).render()?;
+    let text = AdminTemplateData::with_data("admin/users", json!(users_json)).render()?;
     Ok(Html(text))
+}
+
+#[get("/users/<uuid>")]
+fn get_user_json(uuid: String, _token: AdminToken, conn: DbConn) -> JsonResult {
+    let user = get_user_or_404(&uuid, &conn)?;
+
+    Ok(Json(user.to_json(&conn)))
 }
 
 #[post("/users/<uuid>/delete")]
 fn delete_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
-    let user = User::find_by_uuid(&uuid, &conn).map_res("User doesn't exist")?;
+    let user = get_user_or_404(&uuid, &conn)?;
     user.delete(&conn)
 }
 
 #[post("/users/<uuid>/deauth")]
 fn deauth_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
-    let mut user = User::find_by_uuid(&uuid, &conn).map_res("User doesn't exist")?;
+    let mut user = get_user_or_404(&uuid, &conn)?;
     Device::delete_all_by_user(&user.uuid, &conn)?;
     user.reset_security_stamp();
 
@@ -345,7 +354,7 @@ fn deauth_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
 
 #[post("/users/<uuid>/disable")]
 fn disable_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
-    let mut user = User::find_by_uuid(&uuid, &conn).map_res("User doesn't exist")?;
+    let mut user = get_user_or_404(&uuid, &conn)?;
     Device::delete_all_by_user(&user.uuid, &conn)?;
     user.reset_security_stamp();
     user.enabled = false;
@@ -355,7 +364,7 @@ fn disable_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
 
 #[post("/users/<uuid>/enable")]
 fn enable_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
-    let mut user = User::find_by_uuid(&uuid, &conn).map_res("User doesn't exist")?;
+    let mut user = get_user_or_404(&uuid, &conn)?;
     user.enabled = true;
 
     user.save(&conn)
@@ -363,7 +372,7 @@ fn enable_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
 
 #[post("/users/<uuid>/remove-2fa")]
 fn remove_2fa(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
-    let mut user = User::find_by_uuid(&uuid, &conn).map_res("User doesn't exist")?;
+    let mut user = get_user_or_404(&uuid, &conn)?;
     TwoFactor::delete_all_by_user(&user.uuid, &conn)?;
     user.totp_recover = None;
     user.save(&conn)
@@ -403,7 +412,6 @@ fn update_user_org_type(data: Json<UserOrgTypeData>, _token: AdminToken, conn: D
     user_to_edit.save(&conn)
 }
 
-
 #[post("/users/update_revision")]
 fn update_revision_users(_token: AdminToken, conn: DbConn) -> EmptyResult {
     User::update_all_revisions(&conn)
@@ -412,7 +420,8 @@ fn update_revision_users(_token: AdminToken, conn: DbConn) -> EmptyResult {
 #[get("/organizations/overview")]
 fn organizations_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<String>> {
     let organizations = Organization::get_all(&conn);
-    let organizations_json: Vec<Value> = organizations.iter()
+    let organizations_json: Vec<Value> = organizations
+        .iter()
         .map(|o| {
             let mut org = o.to_json();
             org["user_count"] = json!(UserOrganization::count_by_org(&o.uuid, &conn));
@@ -423,7 +432,7 @@ fn organizations_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<St
         })
         .collect();
 
-    let text = AdminTemplateData::organizations(organizations_json).render()?;
+    let text = AdminTemplateData::with_data("admin/organizations", json!(organizations_json)).render()?;
     Ok(Html(text))
 }
 
@@ -449,44 +458,40 @@ struct GitCommit {
 }
 
 fn get_github_api<T: DeserializeOwned>(url: &str) -> Result<T, Error> {
-    let github_api = Client::builder().build()?;
+    let github_api = get_reqwest_client();
 
-    Ok(github_api
-        .get(url)
-        .timeout(Duration::from_secs(10))
-        .header(USER_AGENT, "Bitwarden_RS")
-        .send()?
-        .error_for_status()?
-        .json::<T>()?)
+    Ok(github_api.get(url).timeout(Duration::from_secs(10)).send()?.error_for_status()?.json::<T>()?)
 }
 
 fn has_http_access() -> bool {
-    let http_access = Client::builder().build().unwrap();
+    let http_access = get_reqwest_client();
 
-    match http_access
-        .head("https://github.com/dani-garcia/bitwarden_rs")
-        .timeout(Duration::from_secs(10))
-        .header(USER_AGENT, "Bitwarden_RS")
-        .send()
-    {
+    match http_access.head("https://github.com/dani-garcia/vaultwarden").timeout(Duration::from_secs(10)).send() {
         Ok(r) => r.status().is_success(),
         _ => false,
     }
 }
 
 #[get("/diagnostics")]
-fn diagnostics(_token: AdminToken, _conn: DbConn) -> ApiResult<Html<String>> {
+fn diagnostics(_token: AdminToken, ip_header: IpHeader, conn: DbConn) -> ApiResult<Html<String>> {
     use crate::util::read_file_string;
     use chrono::prelude::*;
     use std::net::ToSocketAddrs;
 
     // Get current running versions
-    let vault_version_path = format!("{}/{}", CONFIG.web_vault_folder(), "version.json");
-    let vault_version_str = read_file_string(&vault_version_path)?;
-    let web_vault_version: WebVaultVersion = serde_json::from_str(&vault_version_str)?;
+    let web_vault_version: WebVaultVersion =
+        match read_file_string(&format!("{}/{}", CONFIG.web_vault_folder(), "bwrs-version.json")) {
+            Ok(s) => serde_json::from_str(&s)?,
+            _ => match read_file_string(&format!("{}/{}", CONFIG.web_vault_folder(), "version.json")) {
+                Ok(s) => serde_json::from_str(&s)?,
+                _ => WebVaultVersion {
+                    version: String::from("Version file missing"),
+                },
+            },
+        };
 
     // Execute some environment checks
-    let running_within_docker = std::path::Path::new("/.dockerenv").exists() || std::path::Path::new("/run/.containerenv").exists();
+    let running_within_docker = is_running_in_docker();
     let has_http_access = has_http_access();
     let uses_proxy = env::var_os("HTTP_PROXY").is_some()
         || env::var_os("http_proxy").is_some()
@@ -503,11 +508,11 @@ fn diagnostics(_token: AdminToken, _conn: DbConn) -> ApiResult<Html<String>> {
     // TODO: Maybe we need to cache this using a LazyStatic or something. Github only allows 60 requests per hour, and we use 3 here already.
     let (latest_release, latest_commit, latest_web_build) = if has_http_access {
         (
-            match get_github_api::<GitRelease>("https://api.github.com/repos/dani-garcia/bitwarden_rs/releases/latest") {
+            match get_github_api::<GitRelease>("https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest") {
                 Ok(r) => r.tag_name,
                 _ => "-".to_string(),
             },
-            match get_github_api::<GitCommit>("https://api.github.com/repos/dani-garcia/bitwarden_rs/commits/master") {
+            match get_github_api::<GitCommit>("https://api.github.com/repos/dani-garcia/vaultwarden/commits/main") {
                 Ok(mut c) => {
                     c.sha.truncate(8);
                     c.sha
@@ -519,7 +524,9 @@ fn diagnostics(_token: AdminToken, _conn: DbConn) -> ApiResult<Html<String>> {
             if running_within_docker {
                 "-".to_string()
             } else {
-                match get_github_api::<GitRelease>("https://api.github.com/repos/dani-garcia/bw_web_builds/releases/latest") {
+                match get_github_api::<GitRelease>(
+                    "https://api.github.com/repos/dani-garcia/bw_web_builds/releases/latest",
+                ) {
                     Ok(r) => r.tag_name.trim_start_matches('v').to_string(),
                     _ => "-".to_string(),
                 }
@@ -529,28 +536,41 @@ fn diagnostics(_token: AdminToken, _conn: DbConn) -> ApiResult<Html<String>> {
         ("-".to_string(), "-".to_string(), "-".to_string())
     };
 
+    let ip_header_name = match &ip_header.0 {
+        Some(h) => h,
+        _ => "",
+    };
+
     let diagnostics_json = json!({
         "dns_resolved": dns_resolved,
-        "web_vault_version": web_vault_version.version,
         "latest_release": latest_release,
         "latest_commit": latest_commit,
+        "web_vault_enabled": &CONFIG.web_vault_enabled(),
+        "web_vault_version": web_vault_version.version,
         "latest_web_build": latest_web_build,
         "running_within_docker": running_within_docker,
         "has_http_access": has_http_access,
+        "ip_header_exists": &ip_header.0.is_some(),
+        "ip_header_match": ip_header_name == CONFIG.ip_header(),
+        "ip_header_name": ip_header_name,
+        "ip_header_config": &CONFIG.ip_header(),
         "uses_proxy": uses_proxy,
         "db_type": *DB_TYPE,
+        "db_version": get_sql_server_version(&conn),
         "admin_url": format!("{}/diagnostics", admin_url(Referer(None))),
+        "overrides": &CONFIG.get_overrides().join(", "),
+        "server_time_local": Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string(),
         "server_time": Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(), // Run the date/time check as the last item to minimize the difference
     });
 
-    let text = AdminTemplateData::diagnostics(diagnostics_json).render()?;
+    let text = AdminTemplateData::with_data("admin/diagnostics", diagnostics_json).render()?;
     Ok(Html(text))
 }
 
 #[get("/diagnostics/config")]
-fn get_diagnostics_config(_token: AdminToken) -> JsonResult {
+fn get_diagnostics_config(_token: AdminToken) -> Json<Value> {
     let support_json = CONFIG.get_support_json();
-    Ok(Json(support_json))
+    Json(support_json)
 }
 
 #[post("/config", data = "<data>")]
@@ -565,11 +585,11 @@ fn delete_config(_token: AdminToken) -> EmptyResult {
 }
 
 #[post("/config/backup_db")]
-fn backup_db(_token: AdminToken) -> EmptyResult {
+fn backup_db(_token: AdminToken, conn: DbConn) -> EmptyResult {
     if *CAN_BACKUP {
-        backup_database()
+        backup_database(&conn)
     } else {
-        err!("Can't back up current DB (either it's not SQLite or the 'sqlite' binary is not present)");
+        err!("Can't back up current DB (Only SQLite supports this feature)");
     }
 }
 
